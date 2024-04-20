@@ -58,7 +58,7 @@ class Optimizer(ABC):
         loss
         """
         *new_weights, loss_values = self.update_fn(x_values, y_values, *self.model.weight_values)
-        self.model.weight_values = list(new_weights)
+        self.model.weight_values = new_weights
         self.update_fn.trust_input = True
         return loss_values
 
