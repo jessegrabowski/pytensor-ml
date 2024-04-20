@@ -39,13 +39,35 @@ class Model:
 
 
 Schemes = Literal['zeros', 'xavier_uniform', 'xavier_normal']
-def initialize_weights(model, scheme: Schemes, random_seed: int | str | np.random.Generator):
+
+def _zero_init(shape: tuple[int], *args) -> np.ndarray:
+    return np.zeros(shape, dtype=config.floatX)
+
+def _xavier_uniform_init(shape: tuple[int], rng: np.random.Generator) -> np.ndarray:
+    scale = np.sqrt(6.0 / np.sum(shape))
+    return rng.uniform(-scale, scale, size=shape).astype(config.floatX)
+
+def _xavier_normal_init(shape: tuple[int], rng: np.random.Generator) -> np.ndarray:
+    scale = np.sqrt(2.0 / np.sum(shape))
+    return rng.normal(0, scale, size=shape).astype(config.floatX)
+
+
+initialization_factory = {
+    'zeros': _zero_init,
+    'xavier_uniform': _xavier_uniform_init,
+    'xavier_normal': _xavier_normal_init
+}
+
+def initialize_weights(model, scheme: Schemes, random_seed: int | str | np.random.Generator | None):
     if isinstance(random_seed, str):
         random_seed = sum(map(ord, random_seed))
-    if isinstance(random_seed, int):
+    if isinstance(random_seed, int) or random_seed is None:
         random_seed = np.random.default_rng(random_seed)
 
+    initial_values = []
+    for var in model.weights:
+        shape = var.type.shape
+        f_initialize = initialization_factory[scheme]
+        initial_values.append(f_initialize(shape, random_seed))
 
-
-
-
+    return initial_values

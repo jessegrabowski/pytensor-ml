@@ -33,6 +33,15 @@ class Sigmoid(Activation):
         out.name = 'Sigmoid'
         return out
 
+class Softmax(Activation):
+    def __init__(self, axis: int = -1):
+        self.axis = axis
+
+    def __call__(self, x: pt.TensorLike) -> pt.TensorVariable:
+        out = pt.special.softmax(x, axis=self.axis)
+        out.name = 'Softmax'
+        return out
+
 
 
 __all__ = [
@@ -40,4 +49,5 @@ __all__ = [
     'LeakyReLU',
     'Sigmoid',
     'Tanh',
+    'Softmax'
 ]
