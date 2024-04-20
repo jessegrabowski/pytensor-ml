@@ -1,9 +1,12 @@
 from abc import ABC, abstractmethod
+
+from pytensor import config
+
 from pytensor_ml.model import Model
 from pytensor.gradient import grad
 from pytensor.compile.function import function
 from pytensor.compile.function.types import Function
-from pytensor.tensor import TensorVariable, TensorLike
+from pytensor.tensor import TensorVariable, TensorLike, tensor, sqrt
 from typing import Callable, Sequence
 import numpy as np
 
@@ -97,7 +100,7 @@ class SGD(Optimizer):
         self.learning_rate = learning_rate
         super().__init__(model, loss_fn, ndim_out=ndim_out)
 
-    def update_parameters(self, params: Sequence[TensorVariable], loss: TensorVariable) -> list[TensorVariable]:
+    def update_parameters(self, params: list[TensorVariable], loss: TensorVariable) -> list[TensorVariable]:
         grads = grad(loss, params)
         new_params = []
         for param, d_loss_d_param in zip(params, grads):
@@ -114,7 +117,7 @@ class ADAGrad(Optimizer):
 
         super().__init__(model, loss_fn, ndim_out=ndim_out, optimizer_weights=g2_weights)
 
-    def update_parameters(self, weights: Sequence[TensorVariable], loss: TensorVariable) -> list[TensorVariable]:
+    def update_parameters(self, weights: list[TensorVariable], loss: TensorVariable) -> list[TensorVariable]:
         weights, optimizer_weights = self._split_weights(weights)
         grads = grad(loss, weights)
 
@@ -128,3 +131,49 @@ class ADAGrad(Optimizer):
             new_optimizer_weights.append(new_g2)
 
         return new_weights + new_optimizer_weights
+
+
+class Adam(Optimizer):
+    def __init__(self, model, loss_fn, *,
+                 ndim_out:int=1,
+                 learning_rate: TensorLike = 0.01,
+                 beta1: TensorLike = 0.9,
+                 beta2: TensorLike = 0.999,
+                 epsilon: TensorLike = 1e-8):
+
+        self.learning_rate = learning_rate
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.epsilon = epsilon
+
+        m_weights = [param.type() for param in model.weights]
+        v_weights = [param.type() for param in model.weights]
+        t = tensor('t', shape=(1,), dtype=config.floatX)
+
+        optimizer_weights = m_weights + v_weights + [t]
+        super().__init__(model, loss_fn, ndim_out=ndim_out, optimizer_weights=optimizer_weights)
+
+    def update_parameters(self, weights: list[TensorVariable], loss: TensorVariable) -> list[TensorVariable]:
+        weights, optimizer_weights = self._split_weights(weights)
+        t = optimizer_weights.pop(-1)
+        m_weights, v_weights = self._split_weights(optimizer_weights)
+
+        grads = grad(loss, weights)
+
+        new_weights = []
+        new_m_weights = []
+        new_v_weights = []
+
+        new_t = t + 1
+        a_t = sqrt(1 - self.beta2 ** new_t) / (1 - self.beta1 ** new_t)
+
+        for param, d_loss_d_param, m, v in zip(weights, grads, m_weights, v_weights):
+            weight_update = a_t * m / (sqrt(v) + self.epsilon)
+            new_weights.append(param - self.learning_rate * weight_update)
+
+            new_m = self.beta1 * m + (1 - self.beta1) * d_loss_d_param
+            new_v = self.beta2 * v + (1 - self.beta2) * d_loss_d_param ** 2
+            new_m_weights.append(new_m)
+            new_v_weights.append(new_v)
+
+        return new_weights + new_m_weights + new_v_weights + [new_t]
