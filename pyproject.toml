@@ -6,8 +6,6 @@ filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::RuntimeWarning"]
 
-env = ["NUMBA_DISABLE_JIT = 1"]
-
 [tool.ruff]
 line-length = 100
 target-version = "py39"

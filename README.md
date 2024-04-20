@@ -1,2 +1,2 @@
 # pytensor-ml
-Neural Network package build on Pytensor
+Neural network package built on Pytensor
