@@ -6,7 +6,6 @@ class Layer(ABC):
     def __call__(self, x: TensorLike) -> TensorLike:
         ...
 
-
 class Linear(Layer):
     __props__ = ('name', 'n_out')
 
@@ -44,9 +43,14 @@ def Sequential(*layers: Callable) -> Callable:
 
     return forward
 
+Squeeze = squeeze
+Concatenate = concatenate
+
 
 __all__ = [
     'Linear',
-    'squeeze',
-    'concatenate'
+    'Input'
+    'Sequential'
+    'Squeeze',
+    'Concatenate'
 ]
