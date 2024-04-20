@@ -2,6 +2,8 @@ import pytensor.tensor as pt
 from abc import ABC, abstractmethod
 from typing import Literal
 
+from pytensor.tensor.basic import as_tensor_variable
+
 
 Reductions = Literal['mean', 'sum']
 reduction_dict = {"mean": pt.mean, "sum": pt.sum}
@@ -29,13 +31,11 @@ class CrossEntropy(Loss):
     def __init__(self,
                  reduction: Reductions = 'mean',
                  expect_logits: bool = False,
-                 expect_onehot_labels: bool = False,
-                 epsilon: pt.TensorLike = 1e-8):
+                 expect_onehot_labels: bool = False):
 
         self.reduction = reduction_dict[reduction]
         self.expect_logits = expect_logits
         self.expect_onehot_labels = expect_onehot_labels
-        self.epsilon = epsilon
 
     def loss(self, y_true: pt.TensorVariable, y_pred: pt.TensorVariable) -> pt.TensorVariable:
         """
@@ -51,13 +51,15 @@ class CrossEntropy(Loss):
         -------
 
         """
-
+        y_true = as_tensor_variable(y_true)
+        y_pred = as_tensor_variable(y_pred)
         if self.expect_logits:
-            y_pred = pt.log(pt.special.softmax(y_pred, axis=-1) + self.epsilon)
+            log_softmax = pt.special.log_softmax(y_pred, axis=-1)
+        else:
+            log_softmax = pt.log(y_pred)
+
         if not self.expect_onehot_labels:
-            # TODO: This doesn't work -- needs a custom gradient to get us back to the right shape
-            y_pred = pt.take_along_axis(y_pred,
-                                        pt.broadcast_to(y_true, y_pred.shape).astype(int), axis=-1)
+            log_softmax = pt.take_along_axis(log_softmax, y_true[..., None], axis=-1)[..., 0]
+            return -self.reduction(log_softmax)
 
-        return -self.reduction(y_pred * y_true)
-
+        return -self.reduction((y_true * log_softmax).sum(axis=-1))
