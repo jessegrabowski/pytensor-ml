@@ -177,3 +177,51 @@ class Adam(Optimizer):
             new_v_weights.append(new_v)
 
         return new_weights + new_m_weights + new_v_weights + [new_t]
+
+class AdamW(Optimizer):
+    def __init__(self, model, loss_fn, *,
+                 ndim_out:int=1,
+                 learning_rate: TensorLike = 0.01,
+                 beta1: TensorLike = 0.9,
+                 beta2: TensorLike = 0.999,
+                 epsilon: TensorLike = 1e-8,
+                 weight_decay: TensorLike = 0.01):
+
+        self.learning_rate = learning_rate
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.epsilon = epsilon
+        self.weight_decay = weight_decay
+
+        m_weights = [param.type() for param in model.weights]
+        v_weights = [param.type() for param in model.weights]
+        t = tensor('t', shape=(1,), dtype=config.floatX)
+
+        optimizer_weights = m_weights + v_weights + [t]
+        super().__init__(model, loss_fn, ndim_out=ndim_out, optimizer_weights=optimizer_weights)
+
+    def update_parameters(self, weights: list[TensorVariable], loss: TensorVariable) -> list[TensorVariable]:
+        weights, optimizer_weights = self._split_weights(weights)
+        t = optimizer_weights.pop(-1)
+        m_weights, v_weights = self._split_weights(optimizer_weights)
+
+        grads = grad(loss, weights)
+
+        new_weights = []
+        new_m_weights = []
+        new_v_weights = []
+
+        new_t = t + 1
+        a_t = sqrt(1 - self.beta2 ** new_t) / (1 - self.beta1 ** new_t)
+
+        for param, d_loss_d_param, m, v in zip(weights, grads, m_weights, v_weights):
+            decayed_param = (1 - self.weight_decay * self.learning_rate) * param
+            weight_update = a_t * m / (sqrt(v) + self.epsilon)
+            new_weights.append(decayed_param - self.learning_rate * weight_update)
+
+            new_m = self.beta1 * m + (1 - self.beta1) * d_loss_d_param
+            new_v = self.beta2 * v + (1 - self.beta2) * d_loss_d_param ** 2
+            new_m_weights.append(new_m)
+            new_v_weights.append(new_v)
+
+        return new_weights + new_m_weights + new_v_weights + [new_t]
