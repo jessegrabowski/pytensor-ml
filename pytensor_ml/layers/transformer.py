@@ -201,6 +201,7 @@ class TransformerBlock(Layer):
         bias: bool = True,
         is_causal: bool = False,
         n_kv_head: int | None = None,
+        fused_qkv: bool = False,
         epsilon: float = 1e-5,
         residual_initializer: Initializer | None = None,
     ):
@@ -215,6 +216,7 @@ class TransformerBlock(Layer):
             n_embd=d_model,
             n_head=n_head,
             n_kv_head=n_kv_head,
+            fused_qkv=fused_qkv,
             bias=bias,
             is_causal=is_causal,
             out_proj_initializer=residual_initializer,

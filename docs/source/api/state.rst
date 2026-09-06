@@ -33,5 +33,7 @@ Initializers
     XavierUniformInitializer
     OrthogonalInitializer
     UnrecordedInitializer
+    EmptyInitializer
+    initial_values_from
     initialize_params
     fans

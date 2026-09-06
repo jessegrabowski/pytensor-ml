@@ -53,6 +53,7 @@ jobs:
               tests/test_checkpoint.py
               tests/test_model.py
               tests/test_pretrained.py
+              tests/test_huggingface_parity.py
               tests/test_pytensorf.py
               tests/test_state.py
               tests/test_base.py

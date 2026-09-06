@@ -1,7 +1,9 @@
 import inspect
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Literal
 
 import numpy as np
@@ -82,12 +84,50 @@ class Initializer(ABC):
         shape : tuple of int
             Shape of the parameter to draw.
         """
-        return self.sample(shape, config.floatX, np.random.default_rng())
+        allocator = _ALLOCATOR.get()
+        drawn_by = self if allocator is None else allocator
+        return drawn_by.sample(shape, config.floatX, np.random.default_rng())
 
     def _sample_like(self, param: SharedVariable, rng: RandomState | None = None) -> np.ndarray:
         rng = np.random.default_rng(rng)
         value = param.get_value()
         return self.sample(value.shape, str(value.dtype), rng)
+
+
+_ALLOCATOR: ContextVar[Initializer | None] = ContextVar("allocator", default=None)
+
+
+@contextmanager
+def initial_values_from(initializer: Initializer) -> Iterator[None]:
+    """
+    Draw the values parameters are born holding from ``initializer`` rather than from what they declare.
+
+    Only the birth value changes. Each parameter still declares the law it came with, so
+    :meth:`~pytensor_ml.model.Model.initialize` redraws it the way it always would.
+
+    Parameters
+    ----------
+    initializer : Initializer
+        Draws every parameter built inside the block, whatever its layer asked for.
+
+    Examples
+    --------
+    Skip the draw entirely for a graph whose weights all arrive from a checkpoint, which is what
+    :func:`~pytensor_ml.pretrained.from_pretrained` does:
+
+    .. code-block:: python
+
+        from pytensor_ml.layers import Linear
+        from pytensor_ml.state import EmptyInitializer, initial_values_from
+
+        with initial_values_from(EmptyInitializer()):
+            layer = Linear("fc", n_in=4096, n_out=4096)
+    """
+    token = _ALLOCATOR.set(initializer)
+    try:
+        yield
+    finally:
+        _ALLOCATOR.reset(token)
 
 
 class ZeroInitializer(Initializer):
@@ -113,6 +153,30 @@ class ZeroInitializer(Initializer):
 
     def sample(self, shape: tuple[int, ...], dtype: str, rng: np.random.Generator) -> np.ndarray:
         return np.zeros(shape, dtype=dtype)
+
+
+class EmptyInitializer(Initializer):
+    """
+    Allocate without filling, for a parameter whose value arrives from somewhere else.
+
+    The memory comes back holding whatever was in it, so a parameter left this way is not a model. Use it
+    only where every parameter is then written: both loaders fill every one of them or raise.
+
+    Examples
+    --------
+    Pair it with :func:`initial_values_from` to build a graph at allocation speed, then fill it:
+
+    .. code-block:: python
+
+        from pytensor_ml.layers import Linear
+        from pytensor_ml.state import EmptyInitializer, initial_values_from
+
+        with initial_values_from(EmptyInitializer()):
+            layer = Linear("fc", n_in=4096, n_out=4096)
+    """
+
+    def sample(self, shape: tuple[int, ...], dtype: str, rng: np.random.Generator) -> np.ndarray:
+        return np.empty(shape, dtype=dtype)
 
 
 class OneInitializer(Initializer):

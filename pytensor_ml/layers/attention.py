@@ -171,6 +171,11 @@ class MultiheadAttention(Layer):
     kv_dim : int, optional
         Model dimension of the key/value input, when cross-attending to a source of a different width.
         Defaults to ``n_embd``.
+    fused_qkv : bool, optional
+        Project queries, keys and values with one weight and split the result, instead of three
+        separate projections. This is the layout GPT-2 and its descendants store, where ``c_attn`` is
+        a single tensor. Incompatible with cross-attention, which projects keys and values from a
+        different input. Default is False.
     bias : bool, optional
         Include bias terms in the projections. Default is True.
     is_causal : bool, optional
@@ -213,6 +218,7 @@ class MultiheadAttention(Layer):
         n_head: int,
         n_kv_head: int | None = None,
         kv_dim: int | None = None,
+        fused_qkv: bool = False,
         bias: bool = True,
         is_causal: bool = False,
         out_proj_initializer: Initializer | None = None,
@@ -230,16 +236,36 @@ class MultiheadAttention(Layer):
         self.head_dim = n_embd // n_head
         self.kv_dim = kv_dim if kv_dim is not None else n_embd
         self.is_causal = is_causal
+        self.fused_qkv = fused_qkv
 
-        self.q_proj = Linear(
-            f"{self.name}_q_proj", n_in=n_embd, n_out=n_head * self.head_dim, bias=bias
-        )
-        self.k_proj = Linear(
-            f"{self.name}_k_proj", n_in=self.kv_dim, n_out=n_kv_head * self.head_dim, bias=bias
-        )
-        self.v_proj = Linear(
-            f"{self.name}_v_proj", n_in=self.kv_dim, n_out=n_kv_head * self.head_dim, bias=bias
-        )
+        if fused_qkv and self.kv_dim != n_embd:
+            raise ValueError(
+                f"{self.name} cannot project a {self.kv_dim}-wide key/value input through a weight "
+                f"shared with {n_embd}-wide queries, so fused_qkv and kv_dim are mutually exclusive."
+            )
+
+        self.q_width = n_head * self.head_dim
+        self.kv_width = n_kv_head * self.head_dim
+
+        self.qkv_proj: Linear | None = None
+        self.q_proj: Linear | None = None
+        self.k_proj: Linear | None = None
+        self.v_proj: Linear | None = None
+        if fused_qkv:
+            self.qkv_proj = Linear(
+                f"{self.name}_qkv_proj",
+                n_in=n_embd,
+                n_out=self.q_width + 2 * self.kv_width,
+                bias=bias,
+            )
+        else:
+            self.q_proj = Linear(f"{self.name}_q_proj", n_in=n_embd, n_out=self.q_width, bias=bias)
+            self.k_proj = Linear(
+                f"{self.name}_k_proj", n_in=self.kv_dim, n_out=self.kv_width, bias=bias
+            )
+            self.v_proj = Linear(
+                f"{self.name}_v_proj", n_in=self.kv_dim, n_out=self.kv_width, bias=bias
+            )
         self.out_proj = Linear(
             f"{self.name}_out_proj",
             n_in=n_head * self.head_dim,
@@ -278,6 +304,11 @@ class MultiheadAttention(Layer):
         attended : TensorVariable
             Shape ``(batch, seq, n_embd)``.
         """
+        if kv is not None and self.fused_qkv:
+            raise ValueError(
+                f"{self.name} projects keys and values from the same weight as queries, so they "
+                f"cannot come from a second input; fused_qkv and kv are mutually exclusive."
+            )
         if kv is not None and self.is_causal:
             raise ValueError(
                 f"{self.name} cannot mask against earlier positions of a sequence it is not "
@@ -287,9 +318,16 @@ class MultiheadAttention(Layer):
         x = pt.as_tensor(x)
         kv = x if kv is None else pt.as_tensor(kv)
 
-        q = self._split_heads(self.q_proj(x), self.n_head)
-        k = self._split_heads(self.k_proj(kv), self.n_kv_head)
-        v = self._split_heads(self.v_proj(kv), self.n_kv_head)
+        if self.qkv_proj is not None:
+            widths = [self.q_width, self.kv_width, self.kv_width]
+            queries, key_states, value_states = pt.split(self.qkv_proj(x), widths, axis=-1)
+        else:
+            assert self.q_proj is not None and self.k_proj is not None and self.v_proj is not None
+            queries, key_states, value_states = self.q_proj(x), self.k_proj(kv), self.v_proj(kv)
+
+        q = self._split_heads(queries, self.n_head)
+        k = self._split_heads(key_states, self.n_kv_head)
+        v = self._split_heads(value_states, self.n_kv_head)
 
         if mask is not None:
             mask = pt.as_tensor(mask)

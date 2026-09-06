@@ -9,6 +9,7 @@ from pytensor_ml.params import trainable
 from pytensor_ml.pytensorf import collect_trainable_params
 from pytensor_ml.state import (
     _INITIALIZERS,
+    EmptyInitializer,
     InitializationScheme,
     Initializer,
     NormalInitializer,
@@ -19,6 +20,7 @@ from pytensor_ml.state import (
     XavierUniformInitializer,
     ZeroInitializer,
     fans,
+    initial_values_from,
     initialize_params,
     initializer,
 )
@@ -468,3 +470,32 @@ class TestInitializerDecorator:
 
         with pytest.raises(TypeError, match=expected):
             scaled(**given)
+
+
+def test_initial_values_from_replaces_the_draw_and_leaves_the_declared_law_alone():
+    """A checkpoint fills every weight, so drawing one first is wasted -- but the parameter still has to
+    know how to redraw itself, or reinitializing a loaded model would produce garbage."""
+    with initial_values_from(ZeroInitializer()):
+        layer = Linear("fc", n_in=4, n_out=4)
+
+    np.testing.assert_array_equal(layer.W.get_value(), 0.0)
+    assert isinstance(layer.W.initializer, XavierNormalInitializer)
+    assert (initialize_params([layer.W], rng=0)[0] != 0).any()
+
+
+def test_initial_values_from_unwinds_when_the_body_raises():
+    with pytest.raises(ValueError, match="boom"):
+        with initial_values_from(ZeroInitializer()):
+            raise ValueError("boom")
+
+    assert (Linear("fc", n_in=4, n_out=4).W.get_value() != 0).any()
+
+
+def test_an_empty_draw_allocates_the_shape_without_touching_the_generator():
+    """The point is to do no work, so a draw that quietly consumed entropy would mean it still ran."""
+    rng = np.random.default_rng(0)
+    value = EmptyInitializer().sample((3, 4), "float32", rng)
+
+    assert value.shape == (3, 4)
+    assert value.dtype == np.float32
+    assert rng.bit_generator.state == np.random.default_rng(0).bit_generator.state

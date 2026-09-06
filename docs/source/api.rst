@@ -14,5 +14,6 @@ API Reference
     api/optim
     api/state
     api/serialization
+    api/models
     api/pytensorf
     api/util
