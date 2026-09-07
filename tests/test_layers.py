@@ -1,5 +1,8 @@
+import ast
 import importlib
 import inspect
+
+from pathlib import Path
 
 import numpy as np
 import pytensor
@@ -977,6 +980,34 @@ def test_no_layer_takes_a_hyperparameter_positionally():
     assert not offenders, (
         f"layers taking more positionally than a name or wrapped layers: {offenders}"
     )
+
+
+def test_no_layer_imports_the_model_zoo():
+    """pytensor_ml.models holds published architectures and the checkpoint keys they load from, which
+    is a different job from a general layer. Letting the dependency run the other way is how a layer
+    ends up existing only because one architecture wanted it.
+
+    A module-level import would raise on its own, since models imports layers back. This catches the
+    one that would not: an import moved inside a function to dodge that."""
+    layers_directory = Path(pytensor_ml.layers.__file__).parent
+    offenders = {}
+    for path in sorted(layers_directory.rglob("*.py")):
+        tree = ast.parse(path.read_text())
+        imported = {
+            name
+            for node in ast.walk(tree)
+            for name in (
+                [alias.name for alias in node.names]
+                if isinstance(node, ast.Import)
+                else [node.module]
+                if isinstance(node, ast.ImportFrom) and node.module and not node.level
+                else []
+            )
+            if name.startswith("pytensor_ml.models")
+        }
+        if imported:
+            offenders[path.name] = sorted(imported)
+    assert not offenders
 
 
 def test_a_layer_with_required_hyperparameters_can_go_unnamed():

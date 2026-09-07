@@ -6,9 +6,9 @@ from pytensor.tensor.variable import TensorVariable
 
 from pytensor_ml.activations import GELU, Activation, QuickGELU, ReLU
 from pytensor_ml.layers import Embedding, LayerNorm, Linear, TransformerBlock
-from pytensor_ml.models.binding import bind_layer_norm, bind_linear
-from pytensor_ml.models.keys import KeyMap, channels_last
-from pytensor_ml.models.registry import register_builder
+from pytensor_ml.models.loading.binding import bind_layer_norm, bind_linear
+from pytensor_ml.models.loading.keys import KeyMap, channels_last
+from pytensor_ml.models.loading.registry import register_builder
 
 _ACTIVATIONS: dict[str, Activation] = {
     "quick_gelu": QuickGELU(),

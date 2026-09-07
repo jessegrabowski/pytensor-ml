@@ -8,7 +8,7 @@ from pytensor_ml.models import (
     channels_last,
     register_builder,
 )
-from pytensor_ml.models.registry import _BUILDERS
+from pytensor_ml.models.loading.registry import _BUILDERS
 
 
 @pytest.fixture

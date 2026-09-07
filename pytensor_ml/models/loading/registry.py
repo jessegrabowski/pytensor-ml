@@ -2,7 +2,7 @@ from collections.abc import Callable
 
 from pytensor.graph.basic import Variable
 
-from pytensor_ml.models.keys import KeyMap
+from pytensor_ml.models.loading.keys import KeyMap
 
 Builder = Callable[[dict, KeyMap], tuple[list[Variable], Variable | list[Variable]]]
 
