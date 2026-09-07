@@ -6,22 +6,12 @@ import pytensor.tensor as pt
 import pytest
 
 from pytensor.compile.sharedvalue import SharedVariable
-from pytensor.graph.traversal import ancestors
 from pytensor.tensor.random.type import RandomGeneratorType, random_generator_type
 from safetensors.numpy import save_file
 
 from pytensor_ml.activations import ReLU
 from pytensor_ml.checkpoint import jsonable_rng_state
 from pytensor_ml.layers import BatchNorm, Dropout, Embedding, Linear, Sequential
-from pytensor_ml.models import (
-    KeyMap,
-    architecture_name,
-    bind_linear,
-    build_from_config,
-    channels_last,
-    register_builder,
-)
-from pytensor_ml.models.registry import _BUILDERS
 from pytensor_ml.params import NonTrainableParameter, TrainableParameter
 from pytensor_ml.pretrained import (
     _detect_format,
@@ -41,7 +31,13 @@ from pytensor_ml.state import (
     initialize_params,
     initializer,
 )
-from tests.conftest import constant, he_normal
+from tests.conftest import (
+    TINY_CLIP,
+    constant,
+    he_normal,
+    tiny_clip_tensors,
+    write_huggingface_component,
+)
 
 floatX = pytensor.config.floatX
 
@@ -461,67 +457,6 @@ def test_a_fresh_generator_does_not_need_the_state_it_discards(tmp_path):
     assert type(generator_of(restored).bit_generator).__name__ == "MT19937"
 
 
-@pytest.fixture
-def isolated_builder_registry():
-    """Undo any builder registration a test performs. The registry is module-level, so a leaked entry
-    would answer for every test that ran afterwards."""
-    registered = dict(_BUILDERS)
-    yield
-    _BUILDERS.clear()
-    _BUILDERS.update(registered)
-
-
-@pytest.mark.parametrize(
-    "config",
-    [
-        {"_class_name": "ToyEncoder", "n_in": 4, "n_out": 3},
-        {"model_type": "toy_encoder", "architectures": ["ToyEncoder"], "n_in": 4, "n_out": 3},
-    ],
-    ids=["diffusers", "transformers"],
-)
-def test_registry_dispatches_on_the_declared_class(config, isolated_builder_registry):
-    """Diffusers and transformers spell the architecture differently, and both resolve to the class
-    name a builder registers under."""
-
-    @register_builder("ToyEncoder")
-    def build_toy_encoder(cfg, keys):
-        X = pt.tensor("X", shape=(None, cfg["n_in"]))
-        fc = Linear("fc", n_in=cfg["n_in"], n_out=cfg["n_out"])
-        keys.bind(fc.W, "fc.weight", transform=channels_last)
-        return [X], fc(X)
-
-    data_inputs, outputs, keys = build_from_config(config)
-
-    assert architecture_name(config) == "ToyEncoder"
-    assert [variable.name for variable in data_inputs] == ["X"]
-    assert outputs.type.shape == (None, 3)
-    assert keys.keys() == {"fc.weight"}
-
-
-def test_a_config_naming_no_architecture_raises():
-    with pytest.raises(ValueError, match="names no architecture"):
-        build_from_config({"hidden_size": 8})
-
-
-def test_an_unregistered_architecture_raises():
-    with pytest.raises(ValueError, match="No builder is registered for 'NotARealModel'"):
-        build_from_config({"_class_name": "NotARealModel"})
-
-
-def test_registering_an_architecture_twice_raises(isolated_builder_registry):
-    """Import order would otherwise decide which builder answers, silently."""
-
-    @register_builder("ToyEncoder")
-    def build_toy_encoder(cfg, keys):
-        raise AssertionError("not called")
-
-    with pytest.raises(ValueError, match="already has a builder"):
-
-        @register_builder("ToyEncoder")
-        def build_toy_encoder_again(cfg, keys):
-            raise AssertionError("not called")
-
-
 @pytest.mark.parametrize(
     "config",
     [
@@ -536,365 +471,10 @@ def test_a_foreign_config_is_detected_as_huggingface(config):
     assert _detect_format(config) == "huggingface"
 
 
-def test_key_map_builds_paths_from_nested_scopes():
-    """A builder records the module path it is already inside, rather than a loader rediscovering it."""
-    keys = KeyMap()
-    with keys.scope("text_model", "encoder"):
-        for i in range(2):
-            layer = Linear(f"fc_{i}", n_in=4, n_out=4)
-            with keys.scope("layers", str(i), "mlp", "fc1"):
-                keys.bind(layer.W, "weight")
-                keys.bind(layer.b, "bias")
-
-    assert keys.keys() == {
-        "text_model.encoder.layers.0.mlp.fc1.weight",
-        "text_model.encoder.layers.0.mlp.fc1.bias",
-        "text_model.encoder.layers.1.mlp.fc1.weight",
-        "text_model.encoder.layers.1.mlp.fc1.bias",
-    }
-    assert len(keys) == 4
-
-
-def test_key_map_holds_parameters_by_identity():
-    """Two layers built with the same name own identically-named parameters. Keying on the object is
-    what keeps them apart, and is why the map holds parameters rather than strings."""
-    first = Linear("fc", n_in=4, n_out=4)
-    second = Linear("fc", n_in=4, n_out=4)
-    assert first.W.name == second.W.name
-
-    keys = KeyMap()
-    keys.bind(first.W, "first.weight")
-    keys.bind(second.W, "second.weight")
-
-    assert keys.key_for(first.W) == "first.weight"
-    assert keys.key_for(second.W) == "second.weight"
-
-
-def test_key_map_rejects_binding_one_parameter_twice():
-    keys = KeyMap()
-    layer = Linear("fc", n_in=4, n_out=4)
-    keys.bind(layer.W, "encoder.weight")
-
-    with pytest.raises(ValueError, match=r"already bound to 'encoder\.weight'"):
-        keys.bind(layer.W, "decoder.weight")
-
-
-def test_key_map_rejects_binding_one_key_twice():
-    keys = KeyMap()
-    keys.bind(Linear("a", n_in=4, n_out=4).W, "shared.weight")
-
-    with pytest.raises(ValueError, match="cannot load into two parameters"):
-        keys.bind(Linear("b", n_in=4, n_out=4).W, "shared.weight")
-
-
-def test_key_map_scope_unwinds_when_the_body_raises():
-    """A leaked prefix would silently misname every key bound after it."""
-    keys = KeyMap()
-    with pytest.raises(RuntimeError):
-        with keys.scope("encoder"):
-            raise RuntimeError("builder blew up")
-
-    keys.bind(Linear("fc", n_in=4, n_out=4).W, "decoder.weight")
-    assert keys.keys() == {"decoder.weight"}
-
-
-@pytest.mark.parametrize(
-    "checkpoint_shape, expected",
-    [((16, 3), (3, 16)), ((16, 3, 5), (5, 3, 16)), ((16, 3, 3, 5), (3, 5, 3, 16))],
-    ids=["dense", "conv1d", "conv2d"],
-)
-def test_channels_last_moves_the_checkpoint_axes(checkpoint_shape, expected):
-    """HF stores (out, in, *kernel) and this library stores (*kernel, in, out). One move covers every
-    rank, and the element-wise check is what a shape assertion alone would miss on a square kernel."""
-    checkpoint = np.arange(np.prod(checkpoint_shape)).reshape(checkpoint_shape)
-
-    moved = channels_last(checkpoint)
-
-    assert moved.shape == expected
-    for index in np.ndindex(*checkpoint_shape):
-        out_axis, in_axis, *spatial = index
-        assert moved[(*spatial, in_axis, out_axis)] == checkpoint[index]
-
-
-@pytest.mark.parametrize("floatX", ["float32", "float16"])
-def test_load_casts_to_the_parameter_dtype(floatX):
-    """A parameter's dtype is fixed by floatX when the layer builds it; loading cannot change it.
-    Building at float16 is what lets a jax or mlx graph keep the checkpoint's own fp16."""
-    with pytensor.config.change_flags(floatX=floatX):
-        layer = Linear("fc", n_in=4, n_out=3)
-    keys = KeyMap()
-    keys.bind(layer.W, "fc.weight", transform=channels_last)
-    keys.bind(layer.b, "fc.bias")
-
-    checkpoint = {
-        "fc.weight": np.ones((3, 4), dtype="float16"),
-        "fc.bias": np.ones(3, dtype="float16"),
-    }
-    keys.load(checkpoint.__getitem__, checkpoint)
-
-    assert layer.W.get_value().dtype == floatX
-    assert layer.b.get_value().dtype == floatX
-
-
-def test_load_applies_the_bound_transform():
-    layer = Linear("fc", n_in=4, n_out=3)
-    keys = KeyMap()
-    keys.bind(layer.W, "fc.weight", transform=channels_last)
-
-    checkpoint_weight = np.arange(12, dtype="float32").reshape(3, 4)
-    keys.load({"fc.weight": checkpoint_weight}.__getitem__, ["fc.weight"])
-
-    np.testing.assert_array_equal(layer.W.get_value(), checkpoint_weight.T)
-
-
-def test_load_rejects_a_shape_mismatch():
-    """The transform is the thing most likely to be wrong, and on a square kernel a wrong one keeps
-    the right shape -- so this fires on everything else."""
-    layer = Linear("fc", n_in=4, n_out=3)
-    keys = KeyMap()
-    keys.bind(layer.W, "fc.weight")
-
-    with pytest.raises(ValueError, match=r"'fc.weight' holds \(3, 4\) but fc_W needs \(4, 3\)"):
-        keys.load({"fc.weight": np.ones((3, 4), dtype="float32")}.__getitem__, ["fc.weight"])
-
-
-def test_load_raises_when_the_checkpoint_cannot_fill_a_parameter():
-    """A parameter left at its initialization is a wrong model that runs, so this is the one
-    direction that must be fatal -- and fatal before anything is stored."""
-    layer = Linear("fc", n_in=4, n_out=3)
-    keys = KeyMap()
-    keys.bind(layer.W, "fc.weight", transform=channels_last)
-    keys.bind(layer.b, "fc.bias")
-    before = layer.W.get_value().copy()
-
-    with pytest.raises(ValueError, match=r"no tensor for 1 bound parameter\(s\): 'fc.bias'"):
-        keys.load({"fc.weight": np.ones((3, 4), dtype="float32")}.__getitem__, ["fc.weight"])
-
-    np.testing.assert_array_equal(layer.W.get_value(), before)
-
-
-def test_load_reports_a_surplus_tensor_and_proceeds():
-    """Every parameter still got a value, so a spare tensor is reported rather than fatal. Older CLIP
-    checkpoints carry a serialized position_ids that nothing needs."""
-    layer = Linear("fc", n_in=4, n_out=3)
-    keys = KeyMap()
-    keys.bind(layer.W, "fc.weight", transform=channels_last)
-    keys.bind(layer.b, "fc.bias")
-
-    checkpoint = {
-        "fc.weight": np.ones((3, 4), dtype="float32"),
-        "fc.bias": np.zeros(3, dtype="float32"),
-        "fc.position_ids": np.arange(77),
-    }
-    surplus = keys.load(checkpoint.__getitem__, checkpoint)
-
-    assert surplus == ["fc.position_ids"]
-    np.testing.assert_array_equal(layer.W.get_value(), np.ones((4, 3)))
-
-
-TINY_CLIP = {
-    "architectures": ["CLIPTextModel"],
-    "hidden_size": 8,
-    "num_hidden_layers": 2,
-    "num_attention_heads": 2,
-    "intermediate_size": 32,
-    "max_position_embeddings": 16,
-    "vocab_size": 50,
-    "hidden_act": "quick_gelu",
-    "layer_norm_eps": 1e-5,
-    "projection_dim": 4,
-}
-
-
-def test_clip_builder_binds_the_checkpoint_key_of_every_parameter():
-    """The bound keys are HuggingFace's own module paths, so this is what decides whether a real
-    checkpoint loads. Two layers is enough to pin the numbering and the nesting."""
-    _, _, keys = build_from_config(TINY_CLIP)
-
-    per_layer = [
-        "layer_norm1.weight",
-        "layer_norm1.bias",
-        "layer_norm2.weight",
-        "layer_norm2.bias",
-        "self_attn.q_proj.weight",
-        "self_attn.q_proj.bias",
-        "self_attn.k_proj.weight",
-        "self_attn.k_proj.bias",
-        "self_attn.v_proj.weight",
-        "self_attn.v_proj.bias",
-        "self_attn.out_proj.weight",
-        "self_attn.out_proj.bias",
-        "mlp.fc1.weight",
-        "mlp.fc1.bias",
-        "mlp.fc2.weight",
-        "mlp.fc2.bias",
-    ]
-    assert keys.keys() == {
-        "text_model.embeddings.token_embedding.weight",
-        "text_model.embeddings.position_embedding.weight",
-        "text_model.final_layer_norm.weight",
-        "text_model.final_layer_norm.bias",
-        *(f"text_model.encoder.layers.{i}.{name}" for i in range(2) for name in per_layer),
-    }
-
-
-def test_clip_builder_returns_the_final_state_then_every_layer():
-    """SDXL conditions on the second-to-last layer, so the per-layer states are outputs rather than
-    internals a caller would have to rebuild the model to reach."""
-    inputs, outputs, _ = build_from_config(TINY_CLIP)
-
-    assert [variable.name for variable in inputs] == ["input_ids"]
-    assert len(outputs) == TINY_CLIP["num_hidden_layers"] + 1
-    assert outputs[0].name == "last_hidden_state"
-    assert all(output.type.shape == (None, None, 8) for output in outputs)
-
-
-@pytest.mark.parametrize(
-    "hidden_act, expected",
-    [("quick_gelu", "QuickGELU"), ("gelu", "GELU")],
-    ids=["clip_l", "clip_big_g"],
-)
-def test_clip_builder_uses_the_configured_activation(hidden_act, expected):
-    """SDXL's two encoders differ here -- CLIP-L is quick_gelu and bigG is gelu -- so hardcoding
-    either one gets half the conditioning quietly wrong."""
-    _, outputs, _ = build_from_config({**TINY_CLIP, "hidden_act": hidden_act})
-
-    names = {variable.name for variable in ancestors(outputs)}
-    assert expected in names
-
-
-def test_clip_builder_rejects_an_intermediate_size_that_is_not_a_multiple():
-    with pytest.raises(ValueError, match="not a whole multiple of hidden_size"):
-        build_from_config({**TINY_CLIP, "intermediate_size": 30})
-
-
-def test_clip_builder_rejects_an_unknown_activation():
-    with pytest.raises(ValueError, match="hidden_act is 'silu'"):
-        build_from_config({**TINY_CLIP, "hidden_act": "silu"})
-
-
-def test_clip_projection_builder_adds_only_the_projection_head():
-    """The projection sits at the checkpoint's top level, not under text_model, and is the sole
-    difference from the base architecture."""
-    _, _, base = build_from_config(TINY_CLIP)
-    _, _, projected = build_from_config(
-        {**TINY_CLIP, "architectures": ["CLIPTextModelWithProjection"]}
-    )
-
-    assert projected.keys() - base.keys() == {"text_projection.weight"}
-    assert base.keys() - projected.keys() == set()
-
-
-def test_clip_projection_builder_returns_the_pooled_embedding_first():
-    inputs, outputs, _ = build_from_config(
-        {**TINY_CLIP, "architectures": ["CLIPTextModelWithProjection"]}
-    )
-
-    assert outputs[0].name == "text_embeds"
-    assert outputs[0].type.shape == (None, TINY_CLIP["projection_dim"])
-    assert outputs[1].name == "last_hidden_state"
-    assert len(outputs) == TINY_CLIP["num_hidden_layers"] + 2
-
-
-@pytest.mark.parametrize(
-    "eos_token_id, ids, expected_position",
-    [(2, [5, 40, 9, 40], 1), (9, [5, 40, 9, 40], 2)],
-    ids=["legacy_takes_the_largest_id", "matches_the_configured_id"],
-)
-def test_clip_pools_at_the_end_of_stream_token(eos_token_id, ids, expected_position):
-    """Configs written before transformers#24773 carry eos_token_id 2 whatever the tokenizer uses, so
-    they locate the token by taking the largest id instead. SDXL's are of that vintage."""
-    config = {
-        **TINY_CLIP,
-        "architectures": ["CLIPTextModelWithProjection"],
-        "eos_token_id": eos_token_id,
-    }
-    inputs, outputs, keys = build_from_config(config)
-    rng = np.random.default_rng(0)
-    for parameter in collect_trainable_params(outputs[0]):
-        parameter.set_value(rng.normal(size=parameter.get_value().shape))
-
-    pooled_output, final = pytensor.function(inputs, [outputs[0], outputs[1]])(
-        np.array([ids], dtype="int32")
-    )
-    projection = keys.parameter_for("text_projection.weight").get_value()
-
-    np.testing.assert_allclose(
-        pooled_output[0], final[0, expected_position] @ projection, rtol=1e-5, atol=1e-5
-    )
-
-
-def _write_huggingface_component(directory, config, tensors, filename):
-    """A HuggingFace component directory: a config and one safetensors file."""
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "config.json").write_text(json.dumps(config))
-    save_file({key: np.asarray(value) for key, value in tensors.items()}, directory / filename)
-    return directory
-
-
-# The key names and checkpoint shapes HuggingFace writes for a two-layer CLIP of TINY_CLIP's size,
-# spelled out rather than read back from the builder. A fixture derived from the builder cannot fail
-# on a wrong key, a wrong scope or a missing transpose, which is most of what the loader can get
-# wrong.
-TINY_CLIP_CHECKPOINT = {
-    "text_model.embeddings.token_embedding.weight": (50, 8),
-    "text_model.embeddings.position_embedding.weight": (16, 8),
-    "text_model.final_layer_norm.weight": (8,),
-    "text_model.final_layer_norm.bias": (8,),
-    **{
-        f"text_model.encoder.layers.{layer}.{name}": shape
-        for layer in range(2)
-        for name, shape in {
-            "layer_norm1.weight": (8,),
-            "layer_norm1.bias": (8,),
-            "layer_norm2.weight": (8,),
-            "layer_norm2.bias": (8,),
-            "self_attn.q_proj.weight": (8, 8),
-            "self_attn.q_proj.bias": (8,),
-            "self_attn.k_proj.weight": (8, 8),
-            "self_attn.k_proj.bias": (8,),
-            "self_attn.v_proj.weight": (8, 8),
-            "self_attn.v_proj.bias": (8,),
-            "self_attn.out_proj.weight": (8, 8),
-            "self_attn.out_proj.bias": (8,),
-            "mlp.fc1.weight": (32, 8),
-            "mlp.fc1.bias": (32,),
-            "mlp.fc2.weight": (8, 32),
-            "mlp.fc2.bias": (8,),
-        }.items()
-    },
-}
-
-
-def _tiny_clip_tensors():
-    rng = np.random.default_rng(0)
-    return {
-        key: rng.normal(size=shape).astype("float16") for key, shape in TINY_CLIP_CHECKPOINT.items()
-    }
-
-
-def test_the_clip_builder_binds_exactly_what_a_checkpoint_holds():
-    """The fixture below is only worth trusting if it is the checkpoint HuggingFace would write, so
-    the builder's bindings are checked against it rather than the other way round."""
-    _, _, keys = build_from_config(TINY_CLIP)
-
-    assert keys.keys() == set(TINY_CLIP_CHECKPOINT)
-    for key, checkpoint_shape in TINY_CLIP_CHECKPOINT.items():
-        # nn.Linear stores a dense weight channel-first, so every 2-D tensor but the two embedding
-        # tables is the parameter's transpose.
-        stored_as_built = key.endswith(("token_embedding.weight", "position_embedding.weight"))
-        expected = (
-            checkpoint_shape[::-1]
-            if len(checkpoint_shape) == 2 and not stored_as_built
-            else checkpoint_shape
-        )
-        assert keys.parameter_for(key).get_value().shape == expected, key
-
-
 def test_from_pretrained_builds_and_loads_a_huggingface_directory(tmp_path):
     config = {**TINY_CLIP}
-    component = _write_huggingface_component(
-        tmp_path / "text_encoder", config, _tiny_clip_tensors(), "model.safetensors"
+    component = write_huggingface_component(
+        tmp_path / "text_encoder", config, tiny_clip_tensors(), "model.safetensors"
     )
 
     inputs, outputs = from_pretrained(component)
@@ -908,8 +488,8 @@ def test_from_pretrained_builds_and_loads_a_huggingface_directory(tmp_path):
 
 def test_from_pretrained_needs_a_variant_when_several_weight_files_exist(tmp_path):
     config = {**TINY_CLIP}
-    tensors = _tiny_clip_tensors()
-    component = _write_huggingface_component(
+    tensors = tiny_clip_tensors()
+    component = write_huggingface_component(
         tmp_path / "text_encoder", config, tensors, "model.safetensors"
     )
     save_file(
@@ -933,115 +513,13 @@ def test_from_pretrained_reports_a_directory_with_no_safetensors(tmp_path):
         from_pretrained(component)
 
 
-TINY_GPT2 = {
-    "architectures": ["GPT2LMHeadModel"],
-    "n_embd": 8,
-    "n_head": 2,
-    "n_layer": 2,
-    "n_positions": 16,
-    "vocab_size": 20,
-    "activation_function": "gelu_new",
-    "layer_norm_epsilon": 1e-5,
-    "n_inner": None,
-}
-
-
-def test_gpt2_builder_binds_one_key_for_the_fused_attention():
-    """GPT-2 stores q, k and v in a single c_attn tensor, so the graph must own one weight there
-    rather than three. Its Conv1D already stores (in, out), so nothing transposes."""
-    _, _, keys = build_from_config(TINY_GPT2)
-
-    per_layer = [
-        "ln_1.weight",
-        "ln_1.bias",
-        "ln_2.weight",
-        "ln_2.bias",
-        "attn.c_attn.weight",
-        "attn.c_attn.bias",
-        "attn.c_proj.weight",
-        "attn.c_proj.bias",
-        "mlp.c_fc.weight",
-        "mlp.c_fc.bias",
-        "mlp.c_proj.weight",
-        "mlp.c_proj.bias",
-    ]
-    assert keys.keys() == {
-        "wte.weight",
-        "wpe.weight",
-        "ln_f.weight",
-        "ln_f.bias",
-        *(f"h.{i}.{name}" for i in range(2) for name in per_layer),
-    }
-    assert keys.parameter_for("h.0.attn.c_attn.weight").get_value().shape == (8, 24)
-
-
-def test_gpt2_builder_ties_the_head_to_the_token_embedding():
-    """The checkpoint carries no lm_head weight, so the head has to reuse wte rather than bind a
-    parameter the file cannot fill."""
-    inputs, outputs, keys = build_from_config(TINY_GPT2)
-    assert not any("lm_head" in key for key in keys.keys())
-
-    rng = np.random.default_rng(0)
-    for parameter in collect_trainable_params(outputs[0]):
-        parameter.set_value(rng.normal(size=parameter.get_value().shape))
-
-    logits, final = pytensor.function(inputs, [outputs[0], outputs[1]])(
-        np.array([[1, 2, 3]], dtype="int32")
-    )
-    token_embedding = keys.parameter_for("wte.weight").get_value()
-
-    np.testing.assert_allclose(logits, final @ token_embedding.T, rtol=1e-5, atol=1e-5)
-
-
-def test_gpt2_builder_rejects_an_unknown_activation():
-    with pytest.raises(ValueError, match="activation_function is 'swiglu'"):
-        build_from_config({**TINY_GPT2, "activation_function": "swiglu"})
-
-
-@pytest.mark.parametrize("config", [TINY_CLIP, TINY_GPT2], ids=["clip", "gpt2"])
-def test_a_token_id_input_is_an_integer_matrix(config):
-    """Token ids index the embedding table, and pt.matrix defaults to floatX, so the dtype has to be
-    asked for rather than inherited."""
-    inputs, _, _ = build_from_config(config)
-
-    assert inputs[0].type.dtype == "int64"
-
-
-@pytest.mark.parametrize("config", [TINY_CLIP, TINY_GPT2], ids=["clip", "gpt2"])
-def test_a_sequence_longer_than_the_position_table_raises(config):
-    """Past the table the position gather reads out of bounds and returns whatever memory it finds,
-    which is a wrong model that runs."""
-    inputs, outputs, _ = build_from_config(config)
-    predict = pytensor.function(inputs, outputs[0])
-
-    with pytest.raises(AssertionError, match="longer than the 16 positions"):
-        predict(np.zeros((1, 17), dtype="int64"))
-
-    assert predict(np.zeros((1, 16), dtype="int64")).shape[1] == 16
-
-
-@pytest.mark.parametrize(
-    "flag, value",
-    [
-        ("scale_attn_weights", False),
-        ("scale_attn_by_inverse_layer_idx", True),
-        ("reorder_and_upcast_attn", True),
-    ],
-)
-def test_gpt2_builder_rejects_a_config_that_changes_the_attention_arithmetic(flag, value):
-    """These flags load cleanly and return wrong numbers, which is the one failure the key map cannot
-    catch for itself."""
-    with pytest.raises(ValueError, match=flag):
-        build_from_config({**TINY_GPT2, flag: value})
-
-
 def test_a_sharded_checkpoint_is_reported_rather_than_partly_loaded(tmp_path):
     """One shard of a sharded checkpoint would fill some parameters and leave the rest at their
     initialization."""
-    component = _write_huggingface_component(
+    component = write_huggingface_component(
         tmp_path / "text_encoder",
         TINY_CLIP,
-        _tiny_clip_tensors(),
+        tiny_clip_tensors(),
         "model-00001-of-00002.safetensors",
     )
     (component / "model.safetensors.index.json").write_text("{}")
@@ -1051,53 +529,9 @@ def test_a_sharded_checkpoint_is_reported_rather_than_partly_loaded(tmp_path):
 
 
 def test_from_pretrained_rejects_restore_rng_for_a_huggingface_directory(tmp_path):
-    component = _write_huggingface_component(
-        tmp_path / "text_encoder", TINY_CLIP, _tiny_clip_tensors(), "model.safetensors"
+    component = write_huggingface_component(
+        tmp_path / "text_encoder", TINY_CLIP, tiny_clip_tensors(), "model.safetensors"
     )
 
     with pytest.raises(ValueError, match="restore_rng"):
         from_pretrained(component, restore_rng=True)
-
-
-def test_load_reports_a_dtype_numpy_cannot_read():
-    """safetensors raises a bare TypeError for bfloat16, which says nothing about what to do next."""
-    keys = KeyMap()
-    linear = Linear("fc", n_in=2, n_out=2)
-    keys.bind(linear.W, "fc.weight")
-    keys.bind(linear.b, "fc.bias")
-
-    def read(key):
-        raise TypeError("unsupported dtype BF16")
-
-    with pytest.raises(TypeError, match="Re-save the checkpoint"):
-        keys.load(read, ["fc.weight", "fc.bias"])
-
-
-def test_bind_linear_binds_no_bias_for_a_bias_free_layer():
-    """CLIP's text projection has no bias, and binding one would ask the checkpoint for a tensor it
-    does not hold."""
-    keys = KeyMap()
-    bind_linear(keys, Linear("text_projection", n_in=4, n_out=2, bias=False), "text_projection")
-
-    assert keys.keys() == {"text_projection.weight"}
-
-
-@pytest.mark.parametrize(
-    "checkpoint_prefix",
-    ["", "transformer."],
-    ids=["published", "saved_from_the_head_class"],
-)
-def test_load_matches_a_checkpoint_that_adds_or_drops_the_model_prefix(checkpoint_prefix):
-    """Whether the leading segment is there depends on the class the checkpoint was saved from, and
-    the published files invert what transformers writes today."""
-    keys = KeyMap()
-    linear = Linear("fc", n_in=2, n_out=2)
-    keys.bind(linear.W, "h.0.weight")
-    keys.bind(linear.b, "h.0.bias")
-    checkpoint = {
-        f"{checkpoint_prefix}h.0.weight": np.ones((2, 2)),
-        f"{checkpoint_prefix}h.0.bias": np.full(2, 3.0),
-    }
-
-    assert keys.load(checkpoint.__getitem__, checkpoint) == []
-    np.testing.assert_array_equal(linear.b.get_value(), 3.0)
