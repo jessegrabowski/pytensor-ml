@@ -1,6 +1,7 @@
 # Import from the submodule, never the package: this file runs first, so the package is still incomplete.
 import pytensor_ml.models.architectures
 
+from pytensor_ml.models.blocks import ResnetBlock2D
 from pytensor_ml.models.loading import (
     KeyMap,
     architecture_name,
@@ -13,6 +14,7 @@ from pytensor_ml.models.loading import (
 
 __all__ = [
     "KeyMap",
+    "ResnetBlock2D",
     "architecture_name",
     "bind_layer_norm",
     "bind_linear",
