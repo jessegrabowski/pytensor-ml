@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from diffusers.models.attention_processor import Attention
 from diffusers.models.resnet import ResnetBlock2D
 
 HERE = Path(__file__).parent
@@ -60,5 +61,38 @@ def resnet_block_2d():
     np.savez(HERE / "resnet_block_2d.npz", **cases)
 
 
+def attention_block_2d():
+    rng = np.random.default_rng(1)
+    torch.manual_seed(1)
+
+    cases = {}
+    for label, channels, n_head in [("one_head", 8, 1), ("four_heads", 8, 4)]:
+        # The arguments UNetMidBlock2D passes for an autoencoder, which is the only caller here.
+        block = Attention(
+            channels,
+            heads=n_head,
+            dim_head=channels // n_head,
+            rescale_output_factor=1.0,
+            eps=1e-6,
+            norm_num_groups=2,
+            residual_connection=True,
+            bias=True,
+            upcast_softmax=True,
+            _from_deprecated_attn_block=True,
+        ).eval()
+
+        X = rng.normal(size=(2, 4, 4, channels)).astype("float32")
+        with torch.no_grad():
+            output = block(torch.from_numpy(channels_first(X)))
+
+        cases[f"{label}/X"] = X
+        cases[f"{label}/output"] = np.moveaxis(output.numpy(), 1, -1)
+        for key, value in block.state_dict().items():
+            cases[f"{label}/weights/{key}"] = value.numpy()
+
+    np.savez(HERE / "attention_block_2d.npz", **cases)
+
+
 if __name__ == "__main__":
     resnet_block_2d()
+    attention_block_2d()

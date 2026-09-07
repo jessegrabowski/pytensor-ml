@@ -20,6 +20,7 @@ Blocks
     :toctree: generated/
 
     ResnetBlock2D
+    AttentionBlock2D
 
 Binding weights
 ---------------
