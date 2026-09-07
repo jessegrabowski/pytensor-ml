@@ -1,5 +1,5 @@
 from pytensor_ml.layers import LayerNorm, Linear
-from pytensor_ml.models.keys import KeyMap, Transform
+from pytensor_ml.models.loading.keys import KeyMap, Transform
 
 
 def bind_layer_norm(keys: KeyMap, norm: LayerNorm, *parts: str) -> None:
@@ -16,7 +16,7 @@ def bind_linear(
     """
     Bind a dense layer's weight, and its bias when it has one.
 
-    Pass :func:`~pytensor_ml.models.keys.channels_last` for a checkpoint written with ``nn.Linear``,
+    Pass :func:`~pytensor_ml.models.loading.keys.channels_last` for a checkpoint written with ``nn.Linear``,
     which stores ``(out, in)``. Omit it for one written with HuggingFace's ``Conv1D``, which already
     stores ``(in, out)``.
     """

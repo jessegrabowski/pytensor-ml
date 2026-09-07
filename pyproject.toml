@@ -71,6 +71,12 @@ version-file = "pytensor_ml/_version.py"
 [tool.pytest.ini_options]
 minversion = "6.0"
 xfail_strict=true
+# A checkpoint test reads a published snapshot of several GB from disk, so it runs only when asked
+# for: `pytest -m checkpoint`.
+addopts = "-m 'not checkpoint'"
+markers = [
+    "checkpoint: needs a full published checkpoint on disk, not a fixture",
+]
 filterwarnings = [
     "error",
     'ignore:\nArviZ is undergoing a major refactor.*:FutureWarning',

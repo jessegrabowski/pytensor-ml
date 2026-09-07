@@ -1,12 +1,19 @@
+import json
 import logging
+
+from pathlib import Path
 
 import numpy as np
 import pytensor.tensor as pt
 import pytest
 
+from safetensors.numpy import save_file
+
 from pytensor_ml.activations import ReLU
 from pytensor_ml.layers import BatchNorm, Dropout, Linear, Sequential
 from pytensor_ml.state import fans, initializer
+
+REFERENCE_DATA = Path(__file__).parent / "data"
 
 
 @initializer
@@ -82,3 +89,65 @@ def fail_on_swallowed_rewrite_errors(caplog):
     ]
 
     assert not failures, "a node rewriter raised and pytensor swallowed it:\n" + "\n".join(failures)
+
+
+TINY_CLIP = {
+    "architectures": ["CLIPTextModel"],
+    "hidden_size": 8,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 2,
+    "intermediate_size": 32,
+    "max_position_embeddings": 16,
+    "vocab_size": 50,
+    "hidden_act": "quick_gelu",
+    "layer_norm_eps": 1e-5,
+    "projection_dim": 4,
+}
+
+# The key names and checkpoint shapes HuggingFace writes for a two-layer CLIP of TINY_CLIP's size,
+# spelled out rather than read back from the builder. A fixture derived from the builder cannot fail
+# on a wrong key, a wrong scope or a missing transpose, which is most of what the loader can get
+# wrong.
+TINY_CLIP_CHECKPOINT = {
+    "text_model.embeddings.token_embedding.weight": (50, 8),
+    "text_model.embeddings.position_embedding.weight": (16, 8),
+    "text_model.final_layer_norm.weight": (8,),
+    "text_model.final_layer_norm.bias": (8,),
+    **{
+        f"text_model.encoder.layers.{layer}.{name}": shape
+        for layer in range(2)
+        for name, shape in {
+            "layer_norm1.weight": (8,),
+            "layer_norm1.bias": (8,),
+            "layer_norm2.weight": (8,),
+            "layer_norm2.bias": (8,),
+            "self_attn.q_proj.weight": (8, 8),
+            "self_attn.q_proj.bias": (8,),
+            "self_attn.k_proj.weight": (8, 8),
+            "self_attn.k_proj.bias": (8,),
+            "self_attn.v_proj.weight": (8, 8),
+            "self_attn.v_proj.bias": (8,),
+            "self_attn.out_proj.weight": (8, 8),
+            "self_attn.out_proj.bias": (8,),
+            "mlp.fc1.weight": (32, 8),
+            "mlp.fc1.bias": (32,),
+            "mlp.fc2.weight": (8, 32),
+            "mlp.fc2.bias": (8,),
+        }.items()
+    },
+}
+
+
+def write_huggingface_component(directory, config, tensors, filename):
+    """A HuggingFace component directory: a config and one safetensors file."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "config.json").write_text(json.dumps(config))
+    save_file({key: np.asarray(value) for key, value in tensors.items()}, directory / filename)
+    return directory
+
+
+def tiny_clip_tensors():
+    rng = np.random.default_rng(0)
+    return {
+        key: rng.normal(size=shape).astype("float16") for key, shape in TINY_CLIP_CHECKPOINT.items()
+    }

@@ -5,9 +5,9 @@ from pytensor.raise_op import Assert
 
 from pytensor_ml.activations import GELU, Activation, ReLU
 from pytensor_ml.layers import Embedding, LayerNorm, TransformerBlock
-from pytensor_ml.models.binding import bind_layer_norm, bind_linear
-from pytensor_ml.models.keys import KeyMap
-from pytensor_ml.models.registry import register_builder
+from pytensor_ml.models.loading.binding import bind_layer_norm, bind_linear
+from pytensor_ml.models.loading.keys import KeyMap
+from pytensor_ml.models.loading.registry import register_builder
 
 # Config flags that alter the attention arithmetic. A checkpoint setting one differently would load
 # cleanly and return wrong numbers, which is the failure KeyMap.load refuses for weights.

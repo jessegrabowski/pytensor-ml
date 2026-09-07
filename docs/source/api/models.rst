@@ -13,6 +13,15 @@ Dispatch
     build_from_config
     register_builder
 
+Blocks
+------
+
+.. autosummary::
+    :toctree: generated/
+
+    ResnetBlock2D
+    AttentionBlock2D
+
 Binding weights
 ---------------
 
