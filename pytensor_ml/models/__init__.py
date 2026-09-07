@@ -1,4 +1,3 @@
-# Import from the submodule, never the package: this file runs first, so the package is still incomplete.
 import pytensor_ml.models.architectures
 
 from pytensor_ml.models.blocks import AttentionBlock2D, ResnetBlock2D
