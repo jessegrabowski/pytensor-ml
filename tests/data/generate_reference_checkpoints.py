@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from diffusers import AutoencoderKL
 from transformers import (
     CLIPTextConfig,
     CLIPTextModel,
@@ -36,6 +37,17 @@ CLIP_CONFIG = dict(
     eos_token_id=2,
 )
 
+VAE_CONFIG = dict(
+    block_out_channels=[4, 8],
+    down_block_types=["DownEncoderBlock2D", "DownEncoderBlock2D"],
+    up_block_types=["UpDecoderBlock2D", "UpDecoderBlock2D"],
+    layers_per_block=1,
+    norm_num_groups=2,
+    latent_channels=4,
+    in_channels=3,
+    out_channels=3,
+)
+
 GPT2_CONFIG = dict(
     n_embd=8,
     n_head=2,
@@ -52,7 +64,31 @@ def write(name, model, outputs):
     # save_pretrained writes the config and the key names HuggingFace ships, which differ from the
     # state_dict's -- GPT-2's live under transformer. there and at the top level in the file.
     model.save_pretrained(directory, safe_serialization=True)
-    np.savez(directory / "expected_outputs.npz", input_ids=IDS, **outputs)
+    np.savez(directory / "expected_outputs.npz", **outputs)
+
+
+def vae():
+    torch.manual_seed(0)
+    model = AutoencoderKL(**VAE_CONFIG).eval()
+
+    rng = np.random.default_rng(0)
+    latent = rng.normal(size=(1, 8, 8, 4)).astype("float32")
+    image = rng.normal(size=(1, 16, 16, 3)).astype("float32")
+    with torch.no_grad():
+        sample = model.decode(torch.from_numpy(np.moveaxis(latent, -1, 1))).sample
+        posterior = model.encode(torch.from_numpy(np.moveaxis(image, -1, 1))).latent_dist
+
+    write(
+        "tiny_vae",
+        model,
+        {
+            "latent": latent,
+            "sample": np.moveaxis(sample.numpy(), 1, -1),
+            "image": image,
+            "mean": np.moveaxis(posterior.mean.numpy(), 1, -1),
+            "log_variance": np.moveaxis(posterior.logvar.numpy(), 1, -1),
+        },
+    )
 
 
 def main():
@@ -66,6 +102,7 @@ def main():
         "tiny_clip",
         text_model,
         {
+            "input_ids": IDS,
             "last_hidden_state": result.last_hidden_state.numpy(),
             "penultimate_hidden_state": result.hidden_states[-2].numpy(),
         },
@@ -78,6 +115,7 @@ def main():
         "tiny_clip_with_projection",
         projection_model,
         {
+            "input_ids": IDS,
             "text_embeds": result.text_embeds.numpy(),
             "last_hidden_state": result.last_hidden_state.numpy(),
         },
@@ -90,10 +128,13 @@ def main():
         "tiny_gpt2",
         gpt2,
         {
+            "input_ids": IDS,
             "logits": result.logits.numpy(),
             "last_hidden_state": result.hidden_states[-1].numpy(),
         },
     )
+
+    vae()
 
 
 if __name__ == "__main__":
