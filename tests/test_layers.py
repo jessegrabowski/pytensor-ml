@@ -6,6 +6,7 @@ import pytensor
 import pytensor.tensor as pt
 import pytest
 
+from pytensor.compile.mode import Mode
 from pytensor.gradient import verify_grad
 from pytensor.graph.replace import vectorize_graph
 
@@ -26,6 +27,7 @@ from pytensor_ml.layers import (
     MaxPool2D,
     Sequential,
 )
+from pytensor_ml.layers.norm import _standardize
 from pytensor_ml.layers.recurrent import RecurrentCell
 from pytensor_ml.optim import adam
 from pytensor_ml.pytensorf import (
@@ -1012,3 +1014,20 @@ def test_bidirectional_rejects_a_non_string_name():
     backward = pytensor_ml.layers.RNN("backward", n_in=2, n_hidden=2)
     with pytest.raises(TypeError, match=r"Bidirectional's `name` must be a string"):
         pytensor_ml.layers.Bidirectional(forward, backward, name=5)
+
+
+def test_standardizing_accumulates_wider_than_float16():
+    """Squaring a float16 activation overflows past |x| of about 256, and a diffusion decoder's
+    activations reach the thousands -- the variance goes to infinity and every element standardizes
+    to NaN, which is a black image rather than a wrong one. Run on the python linker, since the
+    default backend cannot execute float16 at all."""
+    values = (np.random.default_rng(0).normal(size=(4, 8)) * 3000).astype("float16")
+    assert np.abs(values.astype("float64")).max() ** 2 > np.finfo(np.float16).max
+
+    X = pt.tensor("X", shape=values.shape, dtype="float16")
+    standardized, mu, sigma_sq = _standardize(X, 1e-6, axis=0)
+    computed = pytensor.function([X], standardized, mode=Mode(linker="py", optimizer=None))(values)
+
+    assert not np.isnan(computed).any()
+    assert (computed.dtype, mu.dtype, sigma_sq.dtype) == ("float16",) * 3
+    np.testing.assert_allclose(computed.astype("float64").std(), 1.0, rtol=1e-3)

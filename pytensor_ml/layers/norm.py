@@ -32,9 +32,17 @@ def _standardize(X, epsilon, axis, keepdims=False):
     sigma_sq : TensorVariable
         Biased variance of ``X`` over ``axis``.
     """
-    mu = X.mean(axis=axis, keepdims=keepdims)
-    sigma_sq = X.var(axis=axis, keepdims=keepdims)
-    return (X - mu) / pt.sqrt(sigma_sq + epsilon), mu, sigma_sq
+    # The statistics accumulate at float32 or better whatever X is stored as. Squaring a float16
+    # activation overflows past |x| of about 256, and a diffusion decoder's activations reach the
+    # thousands -- the variance would go to infinity and standardizing would return NaN.
+    accumulator = "float32" if X.dtype in ("float16", "bfloat16") else X.dtype
+    wide = X.astype(accumulator)
+
+    mu = wide.mean(axis=axis, keepdims=keepdims)
+    sigma_sq = wide.var(axis=axis, keepdims=keepdims)
+    standardized = (wide - mu) / pt.sqrt(sigma_sq + epsilon)
+
+    return standardized.astype(X.dtype), mu.astype(X.dtype), sigma_sq.astype(X.dtype)
 
 
 def _affine_input_count(affine: bool) -> int:
