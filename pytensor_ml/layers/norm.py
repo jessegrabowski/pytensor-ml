@@ -103,6 +103,25 @@ def _resolve_n_in(name: str, n_in: int | None, X: pt.TensorVariable | None) -> i
     return inferred
 
 
+def _norm_parameter(
+    name: str, suffix: str, n_in: int, initializer: Initializer | None, default: Initializer
+) -> TrainableParameter:
+    """Build one of a norm layer's learned vectors, named ``{name}_{suffix}``.
+
+    It declares its initializer, so a redraw returns it to the identity transform -- normalizing and then
+    rescaling by a random factor defeats the point of the layer. A caller who wants something else says so,
+    and their choice becomes the declaration.
+    """
+    resolved = default if initializer is None else initializer
+
+    return trainable(
+        resolved.initial_value((n_in,)),
+        f"{name}_{suffix}",
+        initializer=resolved,
+        layer_name=name,
+    )
+
+
 def _affine_parameters(
     name: str,
     n_in: int,
@@ -111,26 +130,11 @@ def _affine_parameters(
 ) -> tuple[TrainableParameter, TrainableParameter]:
     """Build the learned shift and scale. Returns them in the ``(loc, scale)`` order that every norm
     op unpacks its inputs in, so the two cannot drift apart.
-
-    Both declare their initializer, so a redraw returns them to the identity transform -- normalizing and
-    then rescaling by a random factor defeats the point of the layer. A caller who wants something else says
-    so, and their choice becomes the declaration.
     """
-    resolved_loc = ZeroInitializer() if loc_initializer is None else loc_initializer
-    resolved_scale = OneInitializer() if scale_initializer is None else scale_initializer
-    loc = trainable(
-        resolved_loc.initial_value((n_in,)),
-        f"{name}_loc",
-        initializer=resolved_loc,
-        layer_name=name,
+    return (
+        _norm_parameter(name, "loc", n_in, loc_initializer, ZeroInitializer()),
+        _norm_parameter(name, "scale", n_in, scale_initializer, OneInitializer()),
     )
-    scale = trainable(
-        resolved_scale.initial_value((n_in,)),
-        f"{name}_scale",
-        initializer=resolved_scale,
-        layer_name=name,
-    )
-    return loc, scale
 
 
 class BatchNormLayer(LayerOp):
@@ -560,14 +564,8 @@ class RMSNorm(Layer):
             return
 
         if self.affine:
-            resolved = (
-                OneInitializer() if self._scale_initializer is None else self._scale_initializer
-            )
-            self.scale = trainable(
-                resolved.initial_value((n_in,)),
-                f"{self.name}_scale",
-                initializer=resolved,
-                layer_name=self.name,
+            self.scale = _norm_parameter(
+                self.name, "scale", n_in, self._scale_initializer, OneInitializer()
             )
 
         self.initialized = True
