@@ -1080,11 +1080,28 @@ def test_rms_norm_leaves_the_mean_where_it_found_it(rng):
     np.testing.assert_allclose((res**2).mean(axis=-1), 1.0, rtol=1e-3)
 
 
+def test_rms_norm_applies_epsilon_inside_the_square_root(rng):
+    # At the default epsilon, dividing by sqrt(mean_square + eps) and by sqrt(mean_square) + eps
+    # agree to well under the tolerance any other test runs at, so only a large one separates them.
+    X = pt.tensor("X", shape=(None, 6))
+    rms_norm = RMSNorm("rms", n_in=6, epsilon=0.5, affine=False)
+    out = rms_norm(X)
+
+    X_np = rng.normal(size=(3, 6)).astype(floatX)
+
+    np.testing.assert_allclose(
+        out.eval({X: X_np}),
+        rms_norm_reference(X_np, np.ones(6, dtype=floatX), rms_norm.epsilon),
+        rtol=1e-5,
+    )
+
+
 def test_rms_norm_accumulates_wider_than_float16():
     """Squaring is the whole operation here, so a float16 activation of a few thousand overflows
     before it is ever averaged. Run on the python linker, since the default backend cannot execute
     float16 at all."""
     values = (np.random.default_rng(0).normal(size=(4, 8)) * 3000).astype("float16")
+    assert np.abs(values.astype("float64")).max() ** 2 > np.finfo(np.float16).max
 
     X = pt.tensor("X", shape=values.shape, dtype="float16")
     out = RMSNorm(name="RMSNorm_1", n_in=8, affine=False)(X)

@@ -7,7 +7,7 @@ pytest.importorskip("mlx.core")
 
 from pytensor.compile.mode import MLX
 
-from pytensor_ml.layers import GroupNorm, LayerNorm
+from pytensor_ml.layers import GroupNorm, LayerNorm, RMSNorm
 
 
 @pytest.mark.parametrize(
@@ -15,8 +15,9 @@ from pytensor_ml.layers import GroupNorm, LayerNorm
     [
         lambda: GroupNorm("group", n_groups=4, n_in=64, epsilon=1e-6),
         lambda: LayerNorm("layer", n_in=64),
+        lambda: RMSNorm("rms", n_in=64),
     ],
-    ids=["group", "layer"],
+    ids=["group", "layer", "rms"],
 )
 @pytest.mark.parametrize("scale", [1.0, 3000.0], ids=["small", "past_the_square_root"])
 def test_a_norm_survives_float16_activations_it_cannot_square(build, scale):
