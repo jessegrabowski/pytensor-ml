@@ -41,6 +41,8 @@ from pytensor_ml.layers.norm import (
     LayerNormLayer,
     NoRunningStatsBatchNormLayer,
     PredictionBatchNormLayer,
+    RMSNorm,
+    RMSNormLayer,
 )
 from pytensor_ml.layers.padding import (
     ConstantPad1D,
@@ -99,6 +101,7 @@ __all__ = [
     "MultiheadAttention",
     "PoolLayer",
     "PoolLayerGrad",
+    "RMSNorm",
     "Recurrent",
     "RecurrentCell",
     "ReflectionPad1D",

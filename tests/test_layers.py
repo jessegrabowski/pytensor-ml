@@ -25,6 +25,7 @@ from pytensor_ml.layers import (
     LayerNorm,
     Linear,
     MaxPool2D,
+    RMSNorm,
     Sequential,
 )
 from pytensor_ml.layers.norm import _standardize
@@ -1031,3 +1032,64 @@ def test_standardizing_accumulates_wider_than_float16():
     assert not np.isnan(computed).any()
     assert (computed.dtype, mu.dtype, sigma_sq.dtype) == ("float16",) * 3
     np.testing.assert_allclose(computed.astype("float64").std(), 1.0, rtol=1e-3)
+
+
+def rms_norm_reference(X_np, scale_np, epsilon):
+    """Walk the rows one at a time rather than broadcasting the way the layer does, so the two share
+    nothing but the definition and cannot agree about a wrong axis."""
+    flat = X_np.reshape(-1, X_np.shape[-1])
+    expected = np.empty_like(flat)
+    for row in range(flat.shape[0]):
+        features = flat[row].astype("float64")
+        root_mean_square = np.sqrt(sum(value**2 for value in features) / len(features) + epsilon)
+        expected[row] = features / root_mean_square * scale_np
+
+    return expected.reshape(X_np.shape)
+
+
+@pytest.mark.parametrize("batch_shape", [(10,), (2, 4)], ids=["2d", "3d"])
+@pytest.mark.parametrize("n_in", [6, None], ids=["specified", "lazy"])
+def test_rms_norm_forward(n_in, batch_shape, rng):
+    X = pt.tensor("X", shape=(*(None,) * len(batch_shape), 6))
+    rms_norm = RMSNorm(name="RMSNorm_1", n_in=n_in)
+    out = rms_norm(X)
+    assert out.name == "RMSNorm_1_output"
+
+    X_np = rng.normal(size=(*batch_shape, 6)).astype(floatX)
+    scale_np = rng.normal(size=(6,)).astype(floatX)
+    rms_norm.scale.set_value(scale_np)
+
+    res = out.eval({X: X_np})
+
+    np.testing.assert_allclose(res, rms_norm_reference(X_np, scale_np, rms_norm.epsilon), rtol=1e-5)
+
+
+def test_rms_norm_leaves_the_mean_where_it_found_it(rng):
+    """The one thing separating it from LayerNorm is that it rescales without centering. An
+    implementation that subtracted the mean would pass every magnitude check and quietly discard
+    whatever offset the previous layer encoded."""
+    X = pt.tensor("X", shape=(None, 8))
+    out = RMSNorm(name="RMSNorm_1", n_in=8, affine=False)(X)
+
+    X_np = rng.normal(loc=3.0, scale=0.1, size=(10, 8)).astype(floatX)
+    res = out.eval({X: X_np})
+
+    # The rows are a tight cloud around 3, so dividing by their root mean square lands them near 1.
+    # Centering first would land them at 0 instead.
+    np.testing.assert_allclose(res.mean(axis=-1), 1.0, rtol=0.02)
+    np.testing.assert_allclose((res**2).mean(axis=-1), 1.0, rtol=1e-3)
+
+
+def test_rms_norm_accumulates_wider_than_float16():
+    """Squaring is the whole operation here, so a float16 activation of a few thousand overflows
+    before it is ever averaged. Run on the python linker, since the default backend cannot execute
+    float16 at all."""
+    values = (np.random.default_rng(0).normal(size=(4, 8)) * 3000).astype("float16")
+
+    X = pt.tensor("X", shape=values.shape, dtype="float16")
+    out = RMSNorm(name="RMSNorm_1", n_in=8, affine=False)(X)
+    computed = pytensor.function([X], out, mode=Mode(linker="py", optimizer=None))(values)
+
+    assert not np.isnan(computed).any()
+    assert computed.dtype == np.dtype("float16")
+    np.testing.assert_allclose((computed.astype("float64") ** 2).mean(axis=-1), 1.0, rtol=1e-2)

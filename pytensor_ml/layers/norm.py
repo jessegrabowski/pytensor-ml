@@ -13,6 +13,24 @@ def _batch_axes(X: pt.TensorVariable) -> tuple[int, ...]:
     return tuple(range(X.ndim - 1))
 
 
+def _accumulator_dtype(X) -> str:
+    """The width a normalization's statistics accumulate at.
+
+    Squaring a float16 activation overflows past :math:`|x|` of about 256, and a diffusion decoder's
+    activations reach the thousands -- the variance would go to infinity and normalizing would
+    return NaN, which is a black image rather than a wrong one.
+    """
+    return "float32" if X.dtype in ("float16", "bfloat16") else X.dtype
+
+
+def _root_mean_square(X, epsilon, axis=-1, keepdims=True):
+    """Scale ``X`` by its root mean square over ``axis``, leaving its mean where it is."""
+    wide = X.astype(_accumulator_dtype(X))
+    mean_square = pt.mean(pt.square(wide), axis=axis, keepdims=keepdims)
+
+    return (wide / pt.sqrt(mean_square + epsilon)).astype(X.dtype)
+
+
 def _standardize(X, epsilon, axis, keepdims=False):
     """
     Center and scale ``X`` over ``axis``, returning the statistics used.
@@ -32,11 +50,7 @@ def _standardize(X, epsilon, axis, keepdims=False):
     sigma_sq : TensorVariable
         Biased variance of ``X`` over ``axis``.
     """
-    # The statistics accumulate at float32 or better whatever X is stored as. Squaring a float16
-    # activation overflows past |x| of about 256, and a diffusion decoder's activations reach the
-    # thousands -- the variance would go to infinity and standardizing would return NaN.
-    accumulator = "float32" if X.dtype in ("float16", "bfloat16") else X.dtype
-    wide = X.astype(accumulator)
+    wide = X.astype(_accumulator_dtype(X))
 
     mu = wide.mean(axis=axis, keepdims=keepdims)
     sigma_sq = wide.var(axis=axis, keepdims=keepdims)
@@ -454,6 +468,120 @@ class LayerNorm(Layer):
             inputs.extend([self.loc, self.scale])
 
         X_transformed = LayerNormLayer(
+            name=self.name,
+            n_in=self.n_in,
+            epsilon=self.epsilon,
+            affine=self.affine,
+        )(*inputs)
+        X_transformed.name = f"{self.name}_output"
+
+        return X_transformed
+
+
+class RMSNormLayer(UnaryLayerOp):
+    __props__ = ("n_in", "epsilon", "affine")
+
+    def build_inner_graph(self, X, *rest):
+        normalized = _root_mean_square(X, self.epsilon)
+
+        return [normalized * rest[0] if self.affine else normalized]
+
+
+class RMSNorm(Layer):
+    r"""
+    Root-mean-square normalization over the last (feature) axis.
+
+    Rescale each sample by the root mean square of its own features, then optionally apply a learned
+    scale:
+
+    .. math::
+
+        y = \frac{x}{\sqrt{\mathrm{E}[x^2] + \epsilon}} \cdot \gamma,
+
+    where the mean of squares is taken over the last axis. Unlike :class:`LayerNorm` the mean is
+    left where it is, so the transform is a rescaling rather than a standardization, and there is no
+    learned shift to go with the scale.
+
+    Parameters
+    ----------
+    name : str, optional
+        Name used as a prefix for the layer's parameters. Default is "RMSNorm".
+    n_in : int, optional
+        Size of the normalized feature axis. Inferred from the input's last dimension on the first
+        call when omitted.
+    epsilon : float, optional
+        Constant :math:`\epsilon` added to the mean square for numerical stability. Default is 1e-6.
+    affine : bool, optional
+        Apply the learned scale :math:`\gamma`, starting from :math:`\gamma = 1`, which a redraw
+        returns it to. Default is True.
+    scale_initializer : Initializer, optional
+        How :math:`\gamma` is drawn. Ones when omitted, which is the identity; drawing a random
+        factor to rescale a normalized activation by would defeat the layer.
+
+    Examples
+    --------
+    Normalize the queries and keys of an attention head, which is where a diffusion transformer puts
+    it to keep the logits in range:
+
+    .. code-block:: python
+
+        from pytensor_ml.layers import Input, RMSNorm
+
+        queries = Input("queries", shape=(None, 8, 512, 64))
+        normalized = RMSNorm("q_norm", n_in=64)(queries)
+    """
+
+    def __init__(
+        self,
+        name: str | None = None,
+        *,
+        n_in: int | None = None,
+        epsilon: float = 1e-6,
+        affine: bool = True,
+        scale_initializer: Initializer | None = None,
+    ):
+        self.name = _resolve_layer_name(name, type(self).__name__, "n_in")
+        self.n_in = n_in
+        self.epsilon = epsilon
+        self.affine = affine
+        self._scale_initializer = scale_initializer
+
+        self.scale: TrainableParameter | None = None
+
+        self.initialized = False
+        self._initialize_params(None)
+
+    def _initialize_params(self, X: pt.TensorVariable | None):
+        if self.initialized:
+            return
+
+        n_in = _resolve_n_in(self.name, self.n_in, X)
+        if n_in is None:
+            return
+
+        if self.affine:
+            resolved = (
+                OneInitializer() if self._scale_initializer is None else self._scale_initializer
+            )
+            self.scale = trainable(
+                resolved.initial_value((n_in,)),
+                f"{self.name}_scale",
+                initializer=resolved,
+                layer_name=self.name,
+            )
+
+        self.initialized = True
+
+    def __call__(self, X: pt.TensorLike) -> pt.TensorVariable:
+        X = pt.as_tensor(X)
+        self._initialize_params(X)
+
+        inputs = [X]
+        if self.affine:
+            assert self.scale is not None
+            inputs.append(self.scale)
+
+        X_transformed = RMSNormLayer(
             name=self.name,
             n_in=self.n_in,
             epsilon=self.epsilon,
