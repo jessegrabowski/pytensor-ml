@@ -16,9 +16,8 @@ def _batch_axes(X: pt.TensorVariable) -> tuple[int, ...]:
 def _accumulator_dtype(X) -> str:
     """The width a normalization's statistics accumulate at.
 
-    Squaring a float16 activation overflows past :math:`|x|` of about 256, and a diffusion decoder's
-    activations reach the thousands -- the variance would go to infinity and normalizing would
-    return NaN, which is a black image rather than a wrong one.
+    Squaring a float16 activation overflows past :math:`|x|` of about 256, so the statistics are
+    taken wider than the input and cast back.
     """
     return "float32" if X.dtype in ("float16", "bfloat16") else X.dtype
 
@@ -528,8 +527,8 @@ class RMSNorm(Layer):
 
     Examples
     --------
-    Normalize the queries and keys of an attention head, which is where a diffusion transformer puts
-    it to keep the logits in range:
+    Normalize the queries of an attention head, which is where a transformer puts it to keep the
+    logits in range:
 
     .. code-block:: python
 
