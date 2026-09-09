@@ -39,6 +39,7 @@ from pytensor_ml.layers import (
     GroupNorm,
     LayerNorm,
     Linear,
+    RMSNorm,
     Sequential,
     Squeeze,
 )
@@ -134,6 +135,14 @@ def test_batchnorm_variants_roundtrip(kwargs):
 def test_layernorm_roundtrips(affine):
     X, output = initialized_network(
         Linear("fc", n_in=4, n_out=6), LayerNorm("ln", n_in=6, affine=affine)
+    )
+    assert_outputs_roundtrip([X], output, [np.random.default_rng(1).normal(size=(8, 4))])
+
+
+@pytest.mark.parametrize("affine", [True, False], ids=["affine", "no_affine"])
+def test_rmsnorm_roundtrips(affine):
+    X, output = initialized_network(
+        Linear("fc", n_in=4, n_out=6), RMSNorm("rms", n_in=6, affine=affine)
     )
     assert_outputs_roundtrip([X], output, [np.random.default_rng(1).normal(size=(8, 4))])
 

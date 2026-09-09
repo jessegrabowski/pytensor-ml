@@ -13,6 +13,23 @@ def _batch_axes(X: pt.TensorVariable) -> tuple[int, ...]:
     return tuple(range(X.ndim - 1))
 
 
+def _accumulator_dtype(X) -> str:
+    """The width a normalization's statistics accumulate at.
+
+    Squaring a float16 activation overflows past :math:`|x|` of about 256, so the statistics are
+    taken wider than the input and cast back.
+    """
+    return "float32" if X.dtype in ("float16", "bfloat16") else X.dtype
+
+
+def _root_mean_square(X, epsilon):
+    """Scale ``X`` by its root mean square over the last axis, leaving its mean where it is."""
+    wide = X.astype(_accumulator_dtype(X))
+    mean_square = pt.mean(pt.square(wide), axis=-1, keepdims=True)
+
+    return (wide / pt.sqrt(mean_square + epsilon)).astype(X.dtype)
+
+
 def _standardize(X, epsilon, axis, keepdims=False):
     """
     Center and scale ``X`` over ``axis``, returning the statistics used.
@@ -32,9 +49,13 @@ def _standardize(X, epsilon, axis, keepdims=False):
     sigma_sq : TensorVariable
         Biased variance of ``X`` over ``axis``.
     """
-    mu = X.mean(axis=axis, keepdims=keepdims)
-    sigma_sq = X.var(axis=axis, keepdims=keepdims)
-    return (X - mu) / pt.sqrt(sigma_sq + epsilon), mu, sigma_sq
+    wide = X.astype(_accumulator_dtype(X))
+
+    mu = wide.mean(axis=axis, keepdims=keepdims)
+    sigma_sq = wide.var(axis=axis, keepdims=keepdims)
+    standardized = (wide - mu) / pt.sqrt(sigma_sq + epsilon)
+
+    return standardized.astype(X.dtype), mu.astype(X.dtype), sigma_sq.astype(X.dtype)
 
 
 def _affine_input_count(affine: bool) -> int:
@@ -81,6 +102,25 @@ def _resolve_n_in(name: str, n_in: int | None, X: pt.TensorVariable | None) -> i
     return inferred
 
 
+def _norm_parameter(
+    name: str, suffix: str, n_in: int, initializer: Initializer | None, default: Initializer
+) -> TrainableParameter:
+    """Build one of a norm layer's learned vectors, named ``{name}_{suffix}``.
+
+    It declares its initializer, so a redraw returns it to the identity transform -- normalizing and then
+    rescaling by a random factor defeats the point of the layer. A caller who wants something else says so,
+    and their choice becomes the declaration.
+    """
+    resolved = default if initializer is None else initializer
+
+    return trainable(
+        resolved.initial_value((n_in,)),
+        f"{name}_{suffix}",
+        initializer=resolved,
+        layer_name=name,
+    )
+
+
 def _affine_parameters(
     name: str,
     n_in: int,
@@ -89,26 +129,11 @@ def _affine_parameters(
 ) -> tuple[TrainableParameter, TrainableParameter]:
     """Build the learned shift and scale. Returns them in the ``(loc, scale)`` order that every norm
     op unpacks its inputs in, so the two cannot drift apart.
-
-    Both declare their initializer, so a redraw returns them to the identity transform -- normalizing and
-    then rescaling by a random factor defeats the point of the layer. A caller who wants something else says
-    so, and their choice becomes the declaration.
     """
-    resolved_loc = ZeroInitializer() if loc_initializer is None else loc_initializer
-    resolved_scale = OneInitializer() if scale_initializer is None else scale_initializer
-    loc = trainable(
-        resolved_loc.initial_value((n_in,)),
-        f"{name}_loc",
-        initializer=resolved_loc,
-        layer_name=name,
+    return (
+        _norm_parameter(name, "loc", n_in, loc_initializer, ZeroInitializer()),
+        _norm_parameter(name, "scale", n_in, scale_initializer, OneInitializer()),
     )
-    scale = trainable(
-        resolved_scale.initial_value((n_in,)),
-        f"{name}_scale",
-        initializer=resolved_scale,
-        layer_name=name,
-    )
-    return loc, scale
 
 
 class BatchNormLayer(LayerOp):
@@ -446,6 +471,118 @@ class LayerNorm(Layer):
             inputs.extend([self.loc, self.scale])
 
         X_transformed = LayerNormLayer(
+            name=self.name,
+            n_in=self.n_in,
+            epsilon=self.epsilon,
+            affine=self.affine,
+        )(*inputs)
+        X_transformed.name = f"{self.name}_output"
+
+        return X_transformed
+
+
+class RMSNormLayer(UnaryLayerOp):
+    __props__ = ("n_in", "epsilon", "affine")
+
+    def build_inner_graph(self, X, *rest):
+        normalized = _root_mean_square(X, self.epsilon)
+        if not self.affine:
+            return [normalized]
+
+        (scale,) = rest
+
+        return [normalized * scale]
+
+
+class RMSNorm(Layer):
+    r"""
+    Root-mean-square normalization over the last (feature) axis.
+
+    Rescale each sample by the root mean square of its own features, then optionally apply a learned
+    scale:
+
+    .. math::
+
+        y = \frac{x}{\sqrt{\mathrm{E}[x^2] + \epsilon}} \cdot \gamma,
+
+    where the mean of squares is taken over the last axis. Unlike :class:`LayerNorm` the mean is
+    left where it is, so the transform is a rescaling rather than a standardization, and there is no
+    learned shift to go with the scale.
+
+    Parameters
+    ----------
+    name : str, optional
+        Name used as a prefix for the layer's parameters. Default is "RMSNorm".
+    n_in : int, optional
+        Size of the normalized feature axis. Inferred from the input's last dimension on the first
+        call when omitted.
+    epsilon : float, optional
+        Constant :math:`\epsilon` added to the mean square for numerical stability. Default is 1e-6.
+    affine : bool, optional
+        Apply the learned scale :math:`\gamma`, starting from :math:`\gamma = 1`, which a redraw
+        returns it to. Default is True.
+    scale_initializer : Initializer, optional
+        How :math:`\gamma` is drawn. Ones when omitted, which is the identity; drawing a random
+        factor to rescale a normalized activation by would defeat the layer.
+
+    Examples
+    --------
+    Normalize the queries of an attention head, which is where a transformer puts it to keep the
+    logits in range:
+
+    .. code-block:: python
+
+        from pytensor_ml.layers import Input, RMSNorm
+
+        queries = Input("queries", shape=(None, 8, 512, 64))
+        normalized = RMSNorm("q_norm", n_in=64)(queries)
+    """
+
+    def __init__(
+        self,
+        name: str | None = None,
+        *,
+        n_in: int | None = None,
+        epsilon: float = 1e-6,
+        affine: bool = True,
+        scale_initializer: Initializer | None = None,
+    ):
+        self.name = _resolve_layer_name(name, type(self).__name__, "n_in")
+        self.n_in = n_in
+        self.epsilon = epsilon
+        self.affine = affine
+        self._scale_initializer = scale_initializer
+
+        self.scale: TrainableParameter | None = None
+
+        self.initialized = False
+        self._initialize_params(None)
+
+    def _initialize_params(self, X: pt.TensorVariable | None):
+        if self.initialized:
+            return
+
+        n_in = _resolve_n_in(self.name, self.n_in, X)
+        if n_in is None:
+            return
+
+        if self.affine:
+            self.scale = _norm_parameter(
+                self.name, "scale", n_in, self._scale_initializer, OneInitializer()
+            )
+
+        self.initialized = True
+
+    def __call__(self, X: pt.TensorLike) -> pt.TensorVariable:
+        X = pt.as_tensor(X)
+        self._initialize_params(X)
+
+        inputs = [X]
+        if self.affine:
+            assert self.scale is not None
+            inputs.append(self.scale)
+
+        X_transformed = RMSNormLayer(
             name=self.name,
             n_in=self.n_in,
             epsilon=self.epsilon,
