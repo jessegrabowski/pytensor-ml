@@ -23,10 +23,10 @@ def _accumulator_dtype(X) -> str:
     return "float32" if X.dtype in ("float16", "bfloat16") else X.dtype
 
 
-def _root_mean_square(X, epsilon, axis=-1, keepdims=True):
-    """Scale ``X`` by its root mean square over ``axis``, leaving its mean where it is."""
+def _root_mean_square(X, epsilon):
+    """Scale ``X`` by its root mean square over the last axis, leaving its mean where it is."""
     wide = X.astype(_accumulator_dtype(X))
-    mean_square = pt.mean(pt.square(wide), axis=axis, keepdims=keepdims)
+    mean_square = pt.mean(pt.square(wide), axis=-1, keepdims=True)
 
     return (wide / pt.sqrt(mean_square + epsilon)).astype(X.dtype)
 
@@ -487,8 +487,12 @@ class RMSNormLayer(UnaryLayerOp):
 
     def build_inner_graph(self, X, *rest):
         normalized = _root_mean_square(X, self.epsilon)
+        if not self.affine:
+            return [normalized]
 
-        return [normalized * rest[0] if self.affine else normalized]
+        (scale,) = rest
+
+        return [normalized * scale]
 
 
 class RMSNorm(Layer):
