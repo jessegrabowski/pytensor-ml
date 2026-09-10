@@ -47,19 +47,24 @@ Source = "https://github.com/pymc-devs/pytensor-ml"
 Tracker = "https://github.com/pymc-devs/pytensor-ml/issues"
 
 [project.optional-dependencies]
-dev = [
-    "pre-commit",
+test = [
     "pytest",
     "pytest-cov",
     "scikit-learn",
-    "mypy",
-    "jax",
-    "pyyaml",
+    "pyyaml",  # tests/test_workflow_groups.py reads the CI matrix
 ]
-examples = [
+lint = [
+    "pre-commit",
+    "mypy>=2.3.1,<2.4.0",
+]
+notebook = [
     "matplotlib",
-    "tqdm",
+    "seaborn",
+    "scikit-learn",
+    "rich",
+    "ipywidgets",  # rich renders its live progress display through a widget under jupyter
 ]
+dev = ["pytensor_ml[test,lint]"]
 
 [tool.hatch.version]
 source = "vcs"
@@ -157,14 +162,44 @@ files = ["pytensor_ml"]
 channels = ["conda-forge"]
 platforms = ["osx-arm64", "linux-64", "win-64"]
 
-# Autodoc imports pytensor_ml, so the docs environment needs the runtime stack alongside sphinx.
-# Read the Docs cannot read a pixi environment, so it builds from conda_envs/environment-docs.yml;
-# the two lists have to move together.
-[tool.pixi.feature.docs.dependencies]
-python = ">=3.12"
+# Shared by every environment: mypy and autodoc import pytensor_ml, not just the tests.
+[tool.pixi.dependencies]
+python = "3.12.*"
 pytensor = ">=3.3.0,<3.4.0"
 numpy = "*"
 safetensors = "*"
+
+[tool.pixi.pypi-dependencies]
+pytensor_ml = { path = ".", editable = true }
+
+# A conda table adds to the extra of the same name rather than replacing it, and exists only to pin
+# provenance: a compiled package resolved from PyPI would load its own OpenBLAS alongside the
+# conda-forge mkl that numpy and pytensor link. Pure-Python tools stay in the extra.
+[tool.pixi.feature.test.dependencies]
+scikit-learn = "*"
+
+[tool.pixi.feature.test.tasks]
+test = "pytest -vv --durations=25"
+
+[tool.pixi.feature.lint.tasks]
+mypy = "python ./scripts/run_mypy.py"
+lint = "pre-commit run --all-files"
+lint-install = "pre-commit install"
+
+# Same provenance rule as the test feature above. seaborn is itself pure Python, but it pulls in
+# pandas, which is not. jupyterlab and ipykernel are here rather than in the extra because they are
+# how you run the notebooks, not something the notebooks import.
+[tool.pixi.feature.notebook.dependencies]
+matplotlib = "*"
+seaborn = "*"
+scikit-learn = "*"
+jupyterlab = "*"
+ipykernel = "*"
+
+[tool.pixi.feature.notebook.tasks]
+notebook = { cmd = "jupyter lab", cwd = "examples" }
+
+[tool.pixi.feature.docs.dependencies]
 # The gallery extension renders notebook thumbnails with matplotlib.
 matplotlib = "*"
 ipython = "*"
@@ -182,9 +217,6 @@ sphinx-autobuild = "*"
 jupyter-sphinx = "*"
 sphinxcontrib-bibtex = "*"
 
-[tool.pixi.feature.docs.pypi-dependencies]
-pytensor_ml = { path = ".", editable = true }
-
 [tool.pixi.feature.docs.tasks]
 docs-build = { cmd = "sphinx-build -b html source build/html", cwd = "docs" }
 # Rebuilds on save and serves the result at http://localhost:8000. The ignored paths are the ones a
@@ -197,6 +229,49 @@ docs-serve = { cmd = """\
     --ignore '*/source/_thumbnails/*' \
     --ignore '*/source/api/generated/*'\
 """, cwd = "docs" }
+# What Read the Docs runs to hand the rendered site to its server.
+readthedocs = { cmd = """\
+    rm -rf $READTHEDOCS_OUTPUT/html \
+    && cp -r build/html $READTHEDOCS_OUTPUT/html\
+""", cwd = "docs", depends-on = ["docs-build"] }
+
+# A backend reaches only its own environment, so the plain `test` environment keeps proving the
+# library works with no backend installed at all.
+[tool.pixi.feature.jax]
+platforms = ["linux-64", "osx-arm64"]  # jaxlib publishes no Windows wheels
+
+[tool.pixi.feature.jax.pypi-dependencies]
+jax = ">=0.8,<0.9.1"
+jaxlib = "*"
+
+[tool.pixi.feature.mlx]
+platforms = ["osx-arm64"]
+
+[tool.pixi.feature.mlx.pypi-dependencies]
+mlx = ">=0.30,<0.32"
+
+# mlx publishes no wheel for macOS below 14. Pixi otherwise assumes the oldest macOS conda-forge
+# still builds for, and the solve fails with no matching platform tag.
+[tool.pixi.feature.mlx.system-requirements]
+macos = "14.0"
+
+[tool.pixi.feature.torch]
+# CI runs torch on linux only. osx-arm64 is here so the environment stays lockable from a Mac: pixi
+# needs a host-platform interpreter to resolve the editable path dependency, and a linux-only
+# feature fails the solve outright.
+platforms = ["linux-64", "osx-arm64"]
+
+[tool.pixi.feature.torch.pypi-dependencies]
+# The CPU wheel index. Default PyPI torch pulls the bundled CUDA stack, several times the size and
+# unused by every backend test here.
+torch = { version = "*", index = "https://download.pytorch.org/whl/cpu" }
 
 [tool.pixi.environments]
+default = { features = ["test", "lint"] }
+test = { features = ["test"] }
+lint = { features = ["lint"] }
+jax = { features = ["test", "jax"] }
+mlx = { features = ["test", "mlx"] }
+torch = { features = ["test", "torch"] }
 docs = { features = ["docs"] }
+notebook = { features = ["notebook"] }

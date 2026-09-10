@@ -7,19 +7,26 @@ needed to extend it — adding an API page, a notebook example, or a citation.
 Building locally
 ----------------
 
-The docs build from ``docs/`` using the ``pytensor_ml-docs`` conda
+The docs build from ``docs/`` in the pixi ``docs`` environment:
+
+.. code-block:: bash
+
+    pixi run docs-build     # build once into docs/build/html
+    pixi run docs-serve     # rebuild on save, served at http://localhost:8000
+
+``docs/Makefile`` has the same targets for anyone already inside the
 environment:
 
 .. code-block:: bash
 
-    conda env update -f conda_envs/environment-docs.yml
     cd docs
     make show         # build + open the rendered HTML in the default browser
     make livehtml     # auto-rebuild + auto-refresh on every save (sphinx-autobuild)
     make clean        # wipe build/ and all generated source (gallery, thumbnails, autosummary stubs)
 
-Read the Docs builds the same way; ``.readthedocs.yaml`` points at the same
-conda env and ``docs/source/conf.py``.
+Read the Docs builds the same way; ``.readthedocs.yaml`` installs pixi and runs
+the ``readthedocs`` task, which chains ``docs-build`` and copies the rendered
+site into RTD's output directory.
 
 Layout
 ------

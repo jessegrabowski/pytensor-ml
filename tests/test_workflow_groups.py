@@ -1,9 +1,12 @@
 import pathlib
+import tomllib
 
 import yaml
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "run_tests.yml"
+MANIFEST = REPO_ROOT / "pyproject.toml"
+BACKEND_FEATURES = frozenset({"jax", "mlx", "torch"})
 
 
 def ci_matrix():
@@ -23,6 +26,22 @@ def ci_subsets():
         (entry["test-subset"]["name"], entry["test-subset"]["paths"].split())
         for entry in matrix.get("include", [])
     ]
+
+
+def ci_environments():
+    """Return every pixi environment the matrix can select, core groups and `include` alike."""
+    matrix = ci_matrix()
+    include = matrix.get("include", [])
+    return set(matrix["environment"]) | {entry["environment"] for entry in include}
+
+
+def pixi_environments():
+    """Return each pixi environment declared in the manifest, mapped to its feature list."""
+    manifest = tomllib.loads(MANIFEST.read_text())
+    return {
+        name: definition["features"]
+        for name, definition in manifest["tool"]["pixi"]["environments"].items()
+    }
 
 
 def relative(file):
@@ -68,8 +87,9 @@ def test_no_test_file_is_in_two_core_groups():
 
 
 def test_every_ci_group_path_exists():
-    """The check above only reads the primary matrix, so a typo in the `include` entries — the Windows smoke
-    job — would otherwise surface as a file-not-found when that job runs rather than here."""
+    """The check above only reads the primary matrix, so a typo in the `include` entries -- the
+    Windows smoke job -- would otherwise surface as a file-not-found when that job runs rather than
+    here."""
     missing = [
         f"{group}: {path}"
         for group, paths in ci_subsets()
@@ -77,3 +97,25 @@ def test_every_ci_group_path_exists():
         if not (REPO_ROOT / path).exists()
     ]
     assert not missing, f"CI groups name paths that do not exist: {missing}"
+
+
+def test_every_ci_job_names_a_declared_pixi_environment():
+    """A job naming an environment the manifest does not declare fails inside `setup-pixi`, minutes
+    into the run, pointing at the lock file rather than at the typo that caused it."""
+    undeclared = sorted(ci_environments() - set(pixi_environments()))
+
+    assert not undeclared, f"CI jobs name pixi environments that do not exist: {undeclared}"
+
+
+def test_the_core_matrix_environment_installs_no_backend():
+    """Running the core suite with no backend installed is what proves the library does not quietly
+    depend on one. Pointing the core groups at a backend environment would retire that guarantee
+    while leaving every test green."""
+    environments = pixi_environments()
+    offenders = {
+        name: sorted(BACKEND_FEATURES.intersection(environments.get(name, ())))
+        for name in ci_matrix()["environment"]
+        if BACKEND_FEATURES.intersection(environments.get(name, ()))
+    }
+
+    assert not offenders, f"core CI groups run in backend environments: {offenders}"

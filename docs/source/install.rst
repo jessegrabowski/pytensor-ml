@@ -28,8 +28,10 @@ Optional extras
 
 .. code-block:: bash
 
-    pip install "pytensor-ml[examples]"   # matplotlib and tqdm, for the example notebooks
-    pip install "pytensor-ml[dev]"        # test, lint and type-checking tools
+    pip install "pytensor-ml[notebook]"   # what the example notebooks import, plus progress bars
+    pip install "pytensor-ml[test]"       # pytest and the tools the suite needs
+    pip install "pytensor-ml[lint]"       # pre-commit and mypy
+    pip install "pytensor-ml[dev]"        # test + lint together
 
 Backends
 --------
@@ -73,15 +75,16 @@ ask for it.
 Development install
 -------------------
 
+Contributor environments are managed with `pixi <https://pixi.sh>`_, which
+builds them from ``pyproject.toml`` against the checked-in ``pixi.lock``:
+
 .. code-block:: bash
 
     git clone https://github.com/pymc-devs/pytensor-ml.git
     cd pytensor-ml
-    pip install -e ".[dev]"
-    pre-commit install
+    pixi run test
 
-The conda environments under ``conda_envs/`` are the reference setup CI runs
-against, pinned more tightly than the package metadata. Install one of those
-when a failure does not reproduce anywhere else.
+The lock file pins the exact environment CI resolves to, so a failure that
+reproduces in CI reproduces locally.
 
 See :doc:`/dev/contributing` for the rest of the contributor setup.

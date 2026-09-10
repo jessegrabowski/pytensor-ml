@@ -79,12 +79,13 @@ reloading — see the [examples gallery](https://pytensor-ml.readthedocs.io/en/l
 
 ## Contributing
 
-Contributions are welcome. To get set up:
+Contributions are welcome. Environments are managed with [pixi](https://pixi.sh); every environment CI
+uses is defined in `pyproject.toml` and locked in `pixi.lock`:
 
 ```bash
-pip install -e ".[dev]"
-pre-commit install
-pytest
+pixi run test        # the suite a core CI job runs
+pixi run mypy        # the type check CI runs
+pixi run lint        # ruff and the rest, through pre-commit
 ```
 
 Formatting and linting run through `ruff` under pre-commit, and `mypy` checks `pytensor_ml/`; both also run in

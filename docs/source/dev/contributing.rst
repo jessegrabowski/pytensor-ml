@@ -11,49 +11,85 @@ the same work. Link the issue from the pull request.
 Setting up
 ----------
 
+Environments are managed with `pixi <https://pixi.sh>`_. Install it once, and
+every environment CI uses builds itself on first run:
+
 .. code-block:: bash
 
     git clone https://github.com/pymc-devs/pytensor-ml.git
     cd pytensor-ml
-    pip install -e ".[dev]"
-    pre-commit install
+    pixi run lint-install   # install the pre-commit hooks
 
-The conda environments under ``conda_envs/`` are what CI installs, pinned
-harder than the package metadata. Reach for one when a failure reproduces in CI
-but not locally:
+Each environment is defined in ``pyproject.toml``:
 
-.. code-block:: bash
+.. list-table::
+    :header-rows: 1
+    :widths: 16 84
 
-    conda env create -f conda_envs/pytensor_ml.yml
+    * - Environment
+      - Contents
+    * - ``default``
+      - Runtime stack, test tools and lint tools. What a bare ``pixi shell``
+        gives you.
+    * - ``test``
+      - Runtime stack and test tools, and deliberately no backend.
+    * - ``lint``
+      - ``mypy`` and ``pre-commit``.
+    * - ``jax``, ``torch``, ``mlx``
+      - ``test`` plus that one backend, for the dispatch suites.
+    * - ``docs``
+      - The Sphinx stack.
+    * - ``notebook``
+      - JupyterLab and the plotting stack, for the notebooks under ``examples/``.
 
-Docs are built with pixi, which owns its own environment:
-
-.. code-block:: bash
-
-    pixi run docs-build     # build once into docs/build/html
-    pixi run docs-serve     # rebuild on save, served at http://localhost:8000
+The ``test``, ``lint`` and ``notebook`` features are declared once, as
+``[project.optional-dependencies]`` in ``pyproject.toml``. Pixi reads each
+extra as a feature of the same name, so ``pip install ".[test]"`` and
+``pixi run -e test`` install the same set, and a conda table for the same
+feature adds to it rather than replacing it -- which is how the compiled
+packages get pinned to conda-forge builds.
 
 ``pixi.lock`` is checked in, and it has to stay that way. It pins the exact
-environment a docs build resolves to, so a build that works for you works for
-everyone else and for Read the Docs. If a change of yours updates the lock file,
-commit it in the same PR as the change that caused it. A lock file that has
-drifted out of sync with ``pyproject.toml`` is worse than no lock file, because
-it fails somewhere far from the change that broke it.
+environment every job resolves to, so a run that works for you works for
+everyone else, for CI and for Read the Docs. If a change of yours updates the
+lock file, commit it in the same PR as the change that caused it. A lock file
+that has drifted out of sync with ``pyproject.toml`` is worse than no lock file,
+because it fails somewhere far from the change that broke it.
 
 Running the tests
 -----------------
 
 .. code-block:: bash
 
-    pytest                              # everything a core job runs
-    pytest tests/test_layers.py         # one file, while iterating
-    python scripts/run_mypy.py          # the type check CI runs
+    pixi run test                            # everything a core job runs
+    pixi run test tests/test_layers.py       # one file, while iterating
+    pixi run mypy                            # the type check CI runs
+    pixi run lint                            # ruff and the rest, through pre-commit
 
 The backend dispatch tests under ``tests/dispatch/`` need that backend
-installed, and the core environment deliberately installs none of them. One CI
-job per backend covers those, and running the core suite with no backend present
-proves the library does not quietly depend on one. Install the backend you are
-working on to run its tests locally.
+installed, and the ``test`` environment deliberately installs none of them. One
+CI job per backend covers those, and running the core suite with no backend
+present proves the library does not quietly depend on one. Run one of the
+backend environments to cover them locally:
+
+.. code-block:: bash
+
+    pixi run -e jax pytest tests/dispatch/jax/
+    pixi run -e torch pytest tests/dispatch/pytorch/
+    pixi run -e mlx pytest tests/dispatch/mlx/     # Apple silicon only
+
+Docs are built from their own environment:
+
+.. code-block:: bash
+
+    pixi run docs-build     # build once into docs/build/html
+    pixi run docs-serve     # rebuild on save, served at http://localhost:8000
+
+The example notebooks get their own environment:
+
+.. code-block:: bash
+
+    pixi run notebook       # JupyterLab, rooted at examples/
 
 **A new test file has to be added to a CI group.** ``tests/test_workflow_groups.py``
 reads ``.github/workflows/run_tests.yml`` and fails when a test file is in no

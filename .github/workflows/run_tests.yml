@@ -14,17 +14,14 @@ concurrency:
 
 jobs:
   unittest:
-    name: unittest (${{ matrix.os }}, ${{ matrix.python-version }}, ${{ matrix.test-subset.name }})
+    name: unittest (${{ matrix.os }}, ${{ matrix.test-subset.name }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.12"]
-        # Off by default, flipped to 1 by the per-backend jobs under `include`. A core job installs no
-        # backend at all, which is what proves the library runs without one.
-        install-jax: [0]
-        install-mlx: [0]
-        install-torch: [0]
+        # The core groups run in the plain `test` environment, which installs no backend at all --
+        # that is what proves the library runs without one.
+        environment: [test]
         # Groups are balanced on measured cold-compile-cache time, which is what a fresh runner pays.
         # tests/test_workflow_groups.py fails if a test file is missing from every group or listed twice.
         test-subset:
@@ -64,29 +61,26 @@ jobs:
               tests/test_workflow_groups.py
         # Windows runners are roughly twice as slow, and almost everything here is platform independent.
         # It runs one job over the parts that are not: file IO, paths, and compiling a graph to train.
-        # One job per backend, each installing only that backend. They live here rather than in
+        # One job per backend, each in that backend's environment. They live here rather than in
         # `test-subset` because a matrix entry cannot change `os`, and mlx needs macOS.
         include:
           - os: ubuntu-latest
-            python-version: "3.12"
-            install-jax: 1
+            environment: jax
             test-subset:
               name: dispatch-jax
               paths: tests/dispatch/jax/
           - os: macos-15
-            python-version: "3.12"
-            install-mlx: 1
+            environment: mlx
             test-subset:
               name: dispatch-mlx
               paths: tests/dispatch/mlx/
           - os: ubuntu-latest
-            python-version: "3.12"
-            install-torch: 1
+            environment: torch
             test-subset:
               name: dispatch-torch
               paths: tests/dispatch/pytorch/
           - os: windows-latest
-            python-version: "3.12"
+            environment: test
             test-subset:
               name: smoke
               paths: |
@@ -101,73 +95,29 @@ jobs:
 
     defaults:
       run:
-        shell: bash -l {0}
+        shell: bash
 
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      env:
-        CACHE_NUMBER: 0
+    - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
       with:
-        path: ~/conda_pkgs_dir
-        key: ${{ runner.os }}-py${{matrix.python-version}}-conda-${{ env.CACHE_NUMBER }}-${{
-          hashFiles('conda_envs/pytensor_ml.yml') }}
-    - name: Cache multiple paths
-      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      env:
-        # Increase this value to reset cache if pyproject.toml has not changed
-        CACHE_NUMBER: 0
-      with:
-        path: |
-          ~/.cache/pip
-          $RUNNER_TOOL_CACHE/Python/*
-          ~\AppData\Local\pip\Cache
-        key: ${{ runner.os }}-build-${{ matrix.python-version }}-${{ env.CACHE_NUMBER }}-${{
-          hashFiles('pyproject.toml') }}
+        environments: ${{ matrix.environment }}
+        # Keyed on pixi.lock, so the cache turns over exactly when the environment does.
+        cache: true
     - name: Cache the pytensor compile directory
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       env:
         CACHE_NUMBER: 0
       with:
         path: ~/.pytensor
-        key: ${{ runner.os }}-py${{ matrix.python-version }}-pytensor-${{ env.CACHE_NUMBER }}-${{
-          matrix.test-subset.name }}-${{ hashFiles('conda_envs/pytensor_ml.yml') }}
+        key: ${{ runner.os }}-pytensor-${{ env.CACHE_NUMBER }}-${{
+          matrix.test-subset.name }}-${{ hashFiles('pixi.lock') }}
         restore-keys: |
-          ${{ runner.os }}-py${{ matrix.python-version }}-pytensor-${{ env.CACHE_NUMBER }}-${{ matrix.test-subset.name }}-
-    - uses: conda-incubator/setup-miniconda@8ee1f361103df19b6f8c8655fd3967a8ecb162d5 # v4.0.1
-      with:
-        miniforge-variant: Miniforge3
-        miniforge-version: latest
-        mamba-version: "*"
-        activate-environment: pytensor_ml
-        channel-priority: strict
-        environment-file: conda_envs/pytensor_ml.yml
-        python-version: 3.12
-        use-mamba: true
-
-        # IMPORTANT: This may break caching of conda packages! See https://github.com/conda-incubator/setup-miniconda/issues/267
-        use-only-tar-bz2: false
-
-    - name: Install the backend this job tests
-      run: |
-        conda activate pytensor_ml
-        if [[ $INSTALL_JAX == "1" ]]; then pip install "jax>=0.8,<0.9.1" jaxlib; fi
-        if [[ $INSTALL_MLX == "1" ]]; then pip install "mlx>=0.30,<0.32"; fi
-        if [[ $INSTALL_TORCH == "1" ]]; then pip install torch --index-url https://download.pytorch.org/whl/cpu; fi
-      env:
-        INSTALL_JAX: ${{ matrix.install-jax }}
-        INSTALL_MLX: ${{ matrix.install-mlx }}
-        INSTALL_TORCH: ${{ matrix.install-torch }}
-
-    - name: Install current branch
-      run: |
-        conda activate pytensor_ml
-        pip install -e .
-        python --version
+          ${{ runner.os }}-pytensor-${{ env.CACHE_NUMBER }}-${{ matrix.test-subset.name }}-
 
     - name: Run tests
       run: |
-        python -m pytest -vv --durations=25 --cov=pytensor_ml --cov-report=xml --no-cov-on-fail --cov-report term $TEST_SUBSET
+        pixi run -e ${{ matrix.environment }} pytest -vv --durations=25 --cov=pytensor_ml --cov-report=xml --no-cov-on-fail --cov-report term $TEST_SUBSET
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
       with:

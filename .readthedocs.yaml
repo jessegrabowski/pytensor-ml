@@ -1,24 +1,19 @@
 version: 2
 
-sphinx:
-  configuration: docs/source/conf.py
-  fail_on_warning: false
-
-conda:
-  environment: conda_envs/environment-docs.yml
-
-python:
-  install:
-    - method: pip
-      path: .
-
 build:
-  os: "ubuntu-22.04"
+  os: "ubuntu-24.04"
   tools:
+    # Only here to put a viable `mamba` on $PATH, which is how pixi gets installed below. The docs
+    # environment itself comes from pixi, not from this interpreter.
     python: "miniforge3-latest"
-  jobs:
+  # Read the Docs cannot resolve a pixi environment itself, so the build drives pixi directly and
+  # the docs dependency list stays in pyproject.toml alongside every other environment. Setting
+  # this key replaces the whole default build and makes `build.jobs` inert, so the tag fetch is a
+  # command here.
+  commands:
     # hatch-vcs derives the version from git tags; RTD's default checkout is shallow and tagless, so
     # fetch tags or pytensor_ml.__version__ falls back to 0.0.0+unknown and the version selector
     # labels break.
-    post_checkout:
-      - git fetch --tags --unshallow || true
+    - git fetch --tags --unshallow || true
+    - mamba install -y -c conda-forge -c nodefaults pixi
+    - pixi run -e docs readthedocs

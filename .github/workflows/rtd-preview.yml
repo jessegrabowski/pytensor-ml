@@ -10,7 +10,7 @@ on:
     paths:
       - "docs/**"
       - ".readthedocs.yaml"
-      - "conda_envs/environment-docs.yml"
+      - "pixi.lock"
       - "examples/**"
       - "pytensor_ml/**"
       - "pyproject.toml"
