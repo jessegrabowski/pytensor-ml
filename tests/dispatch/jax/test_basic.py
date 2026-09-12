@@ -7,13 +7,12 @@ import pytest
 
 from pytensor.compile.mode import JAX, Mode
 from pytensor.graph.basic import Variable
-from pytensor.graph.rewriting.db import RewriteDatabaseQuery
 from pytensor.link.jax.linker import JAXLinker
 
 jax = pytest.importorskip("jax")
 
-optimizer = RewriteDatabaseQuery(include=["jax"], exclude=JAX._optimizer.exclude)
-jax_mode = Mode(linker=JAXLinker(), optimizer=optimizer)
+# Include canonicalization for ops that lower to supported primitives before JAX dispatch.
+jax_mode = Mode(linker=JAXLinker(), optimizer=JAX._optimizer)
 py_mode = Mode(linker="py", optimizer=None)
 
 

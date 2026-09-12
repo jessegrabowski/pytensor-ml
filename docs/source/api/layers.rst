@@ -10,6 +10,7 @@ Base
     :toctree: generated/
 
     Layer
+    pytensor_ml.base.VariadicLayer
 
 Combinators
 -----------
@@ -72,6 +73,7 @@ Normalization and regularization
 
     BatchNorm
     LayerNorm
+    RMSNorm
     GroupNorm
     Dropout
 
@@ -102,3 +104,5 @@ Attention and transformers
     FeedForward
     TransformerBlock
     scaled_dot_product_attention
+    RotaryEmbedding
+    rotary_embedding

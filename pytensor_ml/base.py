@@ -85,6 +85,32 @@ class Layer(ABC):
     def __call__(self, x: pt.TensorLike) -> pt.TensorVariable: ...
 
 
+class VariadicLayer(ABC):
+    """
+    Base class for graph-building layers that consume multiple tensors.
+
+    Examples
+    --------
+    Declare a layer whose inputs are supplied together:
+
+    .. code-block:: python
+
+        import pytensor.tensor as pt
+
+        from pytensor_ml.base import VariadicLayer
+
+        class Add(VariadicLayer):
+            def __call__(self, *inputs: pt.TensorLike) -> pt.TensorVariable:
+                left, right = inputs
+                return pt.as_tensor(left) + pt.as_tensor(right)
+
+        total = Add()(pt.vector("left"), pt.vector("right"))
+    """
+
+    @abstractmethod
+    def __call__(self, *inputs: pt.TensorLike) -> pt.TensorVariable: ...
+
+
 class LayerOp(SymbolicOp):
     """Base class for the library's neural-network ops.
 
@@ -157,4 +183,4 @@ def update_chain_root(variable: Variable) -> tuple[Variable, int] | None:
         depth += 1
 
 
-__all__ = ["Layer", "LayerOp", "StatefulOp", "UnaryLayerOp", "update_chain_root"]
+__all__ = ["Layer", "LayerOp", "StatefulOp", "UnaryLayerOp", "VariadicLayer", "update_chain_root"]

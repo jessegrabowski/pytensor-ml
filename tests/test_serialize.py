@@ -44,6 +44,7 @@ from pytensor_ml.layers import (
     Squeeze,
 )
 from pytensor_ml.layers.attention import scaled_dot_product_attention
+from pytensor_ml.layers.positional import rotary_embedding
 from pytensor_ml.pytensorf import collect_shared_variables, collect_trainable_params
 from pytensor_ml.serialize.base import _TYPE_FROM_JSON, _TYPE_TO_JSON
 
@@ -153,6 +154,23 @@ def test_groupnorm_roundtrips(affine):
         Linear("fc", n_in=4, n_out=6), GroupNorm("gn", n_groups=3, n_in=6, affine=affine)
     )
     assert_outputs_roundtrip([X], output, [np.random.default_rng(1).normal(size=(8, 4))])
+
+
+@pytest.mark.parametrize("pairing", ["half", "adjacent"])
+@pytest.mark.parametrize(
+    "scaling, scaling_factor",
+    [("none", 1.0), ("linear", 4.0), ("ntk", 4.0)],
+    ids=["unscaled", "linear", "ntk"],
+)
+def test_rotary_embedding_roundtrips(pairing, scaling, scaling_factor):
+    """A restored graph preserves non-default rotation frequencies and pairing."""
+    x = pt.tensor("x", shape=(2, 3, 5, 8))
+    positions = pt.lvector("positions")
+    output = rotary_embedding(
+        x, positions, base=500.0, pairing=pairing, scaling=scaling, scaling_factor=scaling_factor
+    )
+    values = [np.random.default_rng(0).normal(size=(2, 3, 5, 8)), np.arange(5)]
+    assert_outputs_roundtrip([x, positions], output, values)
 
 
 def test_squeeze_roundtrips():

@@ -54,6 +54,7 @@ from pytensor_ml.layers.padding import (
     ZeroPad1D,
     ZeroPad2D,
 )
+from pytensor_ml.layers.positional import RotaryEmbedding, RotaryEmbeddingLayer, rotary_embedding
 from pytensor_ml.layers.recurrent import (
     GRU,
     LSTM,
@@ -108,6 +109,7 @@ __all__ = [
     "ReflectionPad2D",
     "ReplicationPad1D",
     "ReplicationPad2D",
+    "RotaryEmbedding",
     "Sequential",
     "Squeeze",
     "TransformerBlock",
@@ -115,5 +117,6 @@ __all__ = [
     "Upsample2D",
     "ZeroPad1D",
     "ZeroPad2D",
+    "rotary_embedding",
     "scaled_dot_product_attention",
 ]

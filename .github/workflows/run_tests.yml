@@ -20,6 +20,7 @@ jobs:
       matrix:
         os: [ubuntu-latest]
         python-version: ["3.12"]
+        pytensor-mode: [FAST_RUN]
         # Off by default, flipped to 1 by the per-backend jobs under `include`. A core job installs no
         # backend at all, which is what proves the library runs without one.
         install-jax: [0]
@@ -35,6 +36,7 @@ jobs:
             paths: |
               tests/test_transformer.py
               tests/test_layers.py
+              tests/test_positional.py
               tests/test_recurrent.py
               tests/test_conv.py
               tests/test_conv_transpose.py
@@ -64,8 +66,8 @@ jobs:
               tests/test_workflow_groups.py
         # Windows runners are roughly twice as slow, and almost everything here is platform independent.
         # It runs one job over the parts that are not: file IO, paths, and compiling a graph to train.
-        # One job per backend, each installing only that backend. They live here rather than in
-        # `test-subset` because a matrix entry cannot change `os`, and mlx needs macOS.
+        # Backend jobs each install only their backend. Dispatch jobs keep the default mode; positional
+        # jobs run the same general tests in the backend's mode. These live here because mlx needs macOS.
         include:
           - os: ubuntu-latest
             python-version: "3.12"
@@ -79,6 +81,21 @@ jobs:
             test-subset:
               name: dispatch-mlx
               paths: tests/dispatch/mlx/
+          - os: ubuntu-latest
+            python-version: "3.12"
+            install-jax: 1
+            pytensor-mode: JAX
+            test-subset:
+              name: positional-jax
+              paths: tests/test_positional.py
+          - os: macos-15
+            python-version: "3.12"
+            install-mlx: 1
+            pytensor-mode: MLX
+            floatX: float32
+            test-subset:
+              name: positional-mlx
+              paths: tests/test_positional.py
           - os: ubuntu-latest
             python-version: "3.12"
             install-torch: 1
@@ -98,6 +115,7 @@ jobs:
 
     env:
       TEST_SUBSET: ${{ matrix.test-subset.paths }}
+      PYTENSOR_FLAGS: mode=${{ matrix.pytensor-mode || 'FAST_RUN' }},floatX=${{ matrix.floatX || 'float64' }}
 
     defaults:
       run:
