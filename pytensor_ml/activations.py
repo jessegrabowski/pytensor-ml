@@ -20,7 +20,29 @@ def _constant_like(value: float, x: pt.TensorVariable) -> pt.TensorVariable:
     return pt.constant(np.asarray(value, dtype=dtype))
 
 
-class Activation(Layer): ...
+class Activation(Layer):
+    """
+    Base class for the elementwise nonlinearities, each of which is called on an activation.
+
+    Examples
+    --------
+    Subclass it to add a nonlinearity of your own; the body builds a graph from its input:
+
+    .. code-block:: python
+
+        import pytensor.tensor as pt
+
+        from pytensor_ml.activations import Activation
+        from pytensor_ml.layers import Input
+
+
+        class HardTanh(Activation):
+            def __call__(self, X):
+                return pt.clip(X, -1.0, 1.0)
+
+
+        activations = HardTanh()(Input("X", shape=(None, 4)))
+    """
 
 
 class ReLU(Activation):
@@ -32,6 +54,22 @@ class ReLU(Activation):
     .. math::
 
         \mathrm{ReLU}(x) = \max(0, x).
+
+    Examples
+    --------
+    Drop it into a stack wherever a nonlinearity belongs, usually straight after a linear layer:
+
+    .. code-block:: python
+
+        from pytensor_ml.activations import ReLU
+        from pytensor_ml.layers import Input, Linear, Sequential
+
+        X = Input("X", shape=(None, 4))
+        network = Sequential(
+            Linear("fc", n_in=4, n_out=8),
+            ReLU(),
+        )
+        activations = network(X)
     """
 
     def __call__(self, x: pt.TensorLike) -> pt.TensorVariable:
@@ -55,6 +93,23 @@ class LeakyReLU(Activation):
     ----------
     negative_slope : float, optional
         The slope :math:`\alpha` applied to negative inputs. Default is 0.01.
+
+    Examples
+    --------
+    The slope below zero is what separates it from :class:`ReLU`, and a wider one keeps more gradient
+    flowing through units that would otherwise be dead:
+
+    .. code-block:: python
+
+        from pytensor_ml.activations import LeakyReLU
+        from pytensor_ml.layers import Input, Linear, Sequential
+
+        X = Input("X", shape=(None, 4))
+        network = Sequential(
+            Linear("fc", n_in=4, n_out=8),
+            LeakyReLU(negative_slope=0.2),
+        )
+        activations = network(X)
     """
 
     def __init__(self, negative_slope: float = 0.01):
@@ -76,11 +131,27 @@ class Tanh(Activation):
     .. math::
 
         \tanh(x) = \frac{e^x - e^{-x}}{e^x + e^{-x}}.
+
+    Examples
+    --------
+    Squash an activation into ``(-1, 1)``, keeping it centred on zero:
+
+    .. code-block:: python
+
+        from pytensor_ml.activations import Tanh
+        from pytensor_ml.layers import Input, Linear, Sequential
+
+        X = Input("X", shape=(None, 4))
+        network = Sequential(
+            Linear("fc", n_in=4, n_out=8),
+            Tanh(),
+        )
+        activations = network(X)
     """
 
     def __call__(self, x: pt.TensorLike) -> pt.TensorVariable:
         out = pt.tanh(x)
-        out.name = "TanH"
+        out.name = "Tanh"
         return out
 
 
@@ -93,6 +164,22 @@ class Sigmoid(Activation):
     .. math::
 
         \sigma(x) = \frac{1}{1 + e^{-x}}.
+
+    Examples
+    --------
+    Squash an activation into ``(0, 1)``, which is what a binary output head wants:
+
+    .. code-block:: python
+
+        from pytensor_ml.activations import Sigmoid
+        from pytensor_ml.layers import Input, Linear, Sequential
+
+        X = Input("X", shape=(None, 4))
+        network = Sequential(
+            Linear("fc", n_in=4, n_out=8),
+            Sigmoid(),
+        )
+        activations = network(X)
     """
 
     def __call__(self, x: pt.TensorLike) -> pt.TensorVariable:
@@ -110,6 +197,22 @@ class SoftPlus(Activation):
     .. math::
 
         \mathrm{softplus}(x) = \log(1 + e^x).
+
+    Examples
+    --------
+    Reach for it where an output has to stay strictly positive, such as a predicted scale:
+
+    .. code-block:: python
+
+        from pytensor_ml.activations import SoftPlus
+        from pytensor_ml.layers import Input, Linear, Sequential
+
+        X = Input("X", shape=(None, 4))
+        network = Sequential(
+            Linear("fc", n_in=4, n_out=8),
+            SoftPlus(),
+        )
+        activations = network(X)
     """
 
     def __call__(self, x: pt.TensorLike) -> pt.TensorVariable:
@@ -142,6 +245,23 @@ class GELU(Activation):
         This is the variant HuggingFace calls ``"gelu_new"`` / ``"gelu_pytorch_tanh"``, PyTorch exposes
         as ``nn.GELU(approximate="tanh")``, and Flax as ``gelu(approximate=True)``; GPT-2 uses it. It is
         cheaper to evaluate than the exact :math:`\operatorname{erf}` form. Default is True.
+
+    Examples
+    --------
+    The default takes the tanh approximation. Pass ``approximate=False`` for the exact error-function
+    form, which costs more to evaluate:
+
+    .. code-block:: python
+
+        from pytensor_ml.activations import GELU
+        from pytensor_ml.layers import Input, Linear, Sequential
+
+        X = Input("X", shape=(None, 4))
+        network = Sequential(
+            Linear("fc", n_in=4, n_out=8),
+            GELU(approximate=False),
+        )
+        activations = network(X)
     """
 
     def __init__(self, approximate: bool = True):
@@ -175,6 +295,22 @@ class Swish(Activation):
     beta : float, optional
         Slope of the sigmoid gate. Larger :math:`\beta` sharpens the gate toward a ReLU; :math:`\beta
         \to 0` collapses it toward the linear map :math:`x/2`. Default is 1.0.
+
+    Examples
+    --------
+    Raise ``beta`` to sharpen the gate towards ReLU's hinge, or lower it to soften towards a linear unit:
+
+    .. code-block:: python
+
+        from pytensor_ml.activations import Swish
+        from pytensor_ml.layers import Input, Linear, Sequential
+
+        X = Input("X", shape=(None, 4))
+        network = Sequential(
+            Linear("fc", n_in=4, n_out=8),
+            Swish(beta=1.5),
+        )
+        activations = network(X)
     """
 
     def __init__(self, beta: float = 1.0):
@@ -183,8 +319,34 @@ class Swish(Activation):
     def __call__(self, x: pt.TensorLike) -> pt.TensorVariable:
         x = pt.as_tensor(x)
         out = x * pt.sigmoid(_constant_like(self.beta, x) * x)
-        out.name = "Swish"
+        out.name = type(self).__name__
         return out
+
+
+class QuickGELU(Swish):
+    r"""
+    Sigmoid approximation to GELU.
+
+    Compute :math:`\mathrm{QuickGELU}(x) = x \, \sigma(1.702 x)`, which is exactly :class:`Swish`
+    at :math:`\beta = 1.702`. Every OpenAI CLIP checkpoint was trained with it, and loading those
+    weights under :class:`GELU` gives quietly wrong activations rather than an error. Prefer
+    :class:`GELU` for anything new.
+
+    Examples
+    --------
+    Use it where a checkpoint was trained with it, such as a CLIP text encoder's MLP:
+
+    .. code-block:: python
+
+        from pytensor_ml.activations import QuickGELU
+        from pytensor_ml.layers import FeedForward, Input
+
+        X = Input("X", shape=(None, 77, 768))
+        activations = FeedForward("mlp", d_model=768, activation=QuickGELU())(X)
+    """
+
+    def __init__(self):
+        super().__init__(beta=1.702)
 
 
 class Softmax(Activation):
@@ -201,6 +363,24 @@ class Softmax(Activation):
     ----------
     axis : int, optional
         The axis along which the values sum to one. Default is -1.
+
+    Examples
+    --------
+    Normalizes over the last axis by default, which is the class axis of a ``(batch, classes)`` logit
+    matrix. A loss built with ``expect_logits=True`` wants the logits themselves, so reach for this only
+    when you need the probabilities:
+
+    .. code-block:: python
+
+        from pytensor_ml.activations import Softmax
+        from pytensor_ml.layers import Input, Linear, Sequential
+
+        X = Input("X", shape=(None, 4))
+        network = Sequential(
+            Linear("logits", n_in=4, n_out=3),
+            Softmax(axis=-1),
+        )
+        probabilities = network(X)
     """
 
     def __init__(self, axis: int = -1):

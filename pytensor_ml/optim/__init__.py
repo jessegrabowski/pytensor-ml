@@ -9,8 +9,34 @@ from pytensor_ml.optim.alias import (
     rprop,
     sgd,
 )
-from pytensor_ml.optim.base import Transform, UpdateRule, Updates, chain, get_gradients
+from pytensor_ml.optim.base import (
+    Gradients,
+    LearningRate,
+    Rate,
+    Schedule,
+    Steps,
+    Transform,
+    Updates,
+    chain,
+    counter,
+    get_gradients,
+    reuses_state,
+    scalar_state,
+    state_for,
+    steps_of,
+    to_floatx,
+    to_updates,
+)
 from pytensor_ml.optim.clipping import clip_by_global_norm, clip_by_value
+from pytensor_ml.optim.guards import (
+    Decision,
+    SkipCondition,
+    apply_if_finite,
+    large_step,
+    nonfinite,
+    skip_if,
+)
+from pytensor_ml.optim.policy import reduce_on_plateau
 from pytensor_ml.optim.rules import (
     adadelta_updates,
     adagrad_updates,
@@ -22,12 +48,33 @@ from pytensor_ml.optim.rules import (
     rprop_updates,
     sgd_updates,
 )
+from pytensor_ml.optim.schedules import (
+    constant_schedule,
+    cosine_schedule,
+    exponential_schedule,
+    join_schedules,
+    linear_onecycle_schedule,
+    linear_schedule,
+    polynomial_schedule,
+    step_decay,
+)
 from pytensor_ml.optim.train import compile_train
-from pytensor_ml.optim.transform import add_weight_decay, scale, scale_by_schedule, trace
+from pytensor_ml.optim.transform import (
+    add_weight_decay,
+    scale,
+    scale_by_schedule,
+    trace,
+)
 
 __all__ = [
+    "Decision",
+    "Gradients",
+    "LearningRate",
+    "Rate",
+    "Schedule",
+    "SkipCondition",
+    "Steps",
     "Transform",
-    "UpdateRule",
     "Updates",
     "adadelta",
     "adadelta_updates",
@@ -40,20 +87,40 @@ __all__ = [
     "adamw",
     "adamw_updates",
     "add_weight_decay",
+    "apply_if_finite",
     "chain",
     "clip_by_global_norm",
     "clip_by_value",
     "compile_train",
+    "constant_schedule",
+    "cosine_schedule",
+    "counter",
+    "exponential_schedule",
     "get_gradients",
+    "join_schedules",
+    "large_step",
+    "linear_onecycle_schedule",
+    "linear_schedule",
     "nadam",
     "nadam_updates",
+    "nonfinite",
+    "polynomial_schedule",
+    "reduce_on_plateau",
+    "reuses_state",
     "rmsprop",
     "rmsprop_updates",
     "rprop",
     "rprop_updates",
+    "scalar_state",
     "scale",
     "scale_by_schedule",
     "sgd",
     "sgd_updates",
+    "skip_if",
+    "state_for",
+    "step_decay",
+    "steps_of",
+    "to_floatx",
+    "to_updates",
     "trace",
 ]

@@ -4,8 +4,9 @@ import pytensor.tensor as pt
 from pytensor import config
 from pytensor.tensor.variable import TensorVariable
 
-from pytensor_ml.base import Layer, UnaryLayerOp
+from pytensor_ml.base import Layer, UnaryLayerOp, _resolve_layer_name
 from pytensor_ml.layers.linear import Linear
+from pytensor_ml.state import Initializer
 
 
 class AttentionLayer(UnaryLayerOp):
@@ -109,8 +110,26 @@ def scaled_dot_product_attention(
 
     Returns
     -------
-    TensorVariable
+    output : TensorVariable
         Attention output, shape ``(..., n_head, q_len, v_dim)``.
+
+    Examples
+    --------
+    The bare attention kernel, for building an attention variant of your own. It takes heads as an explicit
+    axis -- ``(batch, n_head, time, head_dim)`` -- and knows nothing about positions, so rotary or other
+    positional schemes are applied to ``q`` and ``k`` before the call:
+
+    .. code-block:: python
+
+        import pytensor.tensor as pt
+
+        from pytensor_ml.layers import scaled_dot_product_attention
+
+        q = pt.tensor("q", shape=(None, 8, 128, 32))
+        k = pt.tensor("k", shape=(None, 8, 128, 32))
+        v = pt.tensor("v", shape=(None, 8, 128, 32))
+
+        attended = scaled_dot_product_attention(q, k, v, is_causal=True)
     """
     q, k, v = (pt.as_tensor(t).copy() for t in (q, k, v))
     inputs = [q, k, v]
@@ -131,11 +150,12 @@ def scaled_dot_product_attention(
 
 class MultiheadAttention(Layer):
     r"""
-    Multi-head self-attention.
+    Multi-head attention, over one sequence or between two.
 
-    Project the input to per-head queries, keys, and values, apply
-    :func:`scaled_dot_product_attention`, then project the concatenated heads back to the model
-    dimension. Supports grouped-query attention through ``n_kv_head``.
+    Project to per-head queries, keys, and values, apply :func:`scaled_dot_product_attention`, then
+    project the concatenated heads back to the model dimension. Supports grouped-query attention
+    through ``n_kv_head``. Keys and values come from the query input unless :meth:`__call__` is given
+    a second one, which is cross-attention.
 
     Parameters
     ----------
@@ -148,20 +168,60 @@ class MultiheadAttention(Layer):
     n_kv_head : int, optional
         Number of key/value heads, for grouped-query attention. Must divide ``n_head`` evenly. Defaults
         to ``n_head`` (standard multi-head attention).
+    kv_dim : int, optional
+        Model dimension of the key/value input, when cross-attending to a source of a different width.
+        Defaults to ``n_embd``.
+    fused_qkv : bool, optional
+        Project queries, keys and values with one weight and split the result, instead of three
+        separate projections. This is the layout GPT-2 and its descendants store, where ``c_attn`` is
+        a single tensor. Incompatible with cross-attention, which projects keys and values from a
+        different input. Default is False.
     bias : bool, optional
         Include bias terms in the projections. Default is True.
     is_causal : bool, optional
-        Apply a causal mask in the attention. Default is False.
+        Apply a causal mask in the attention. Cannot be combined with cross-attention. Default is
+        False.
+    out_proj_initializer : Initializer, optional
+        How the output projection's weight is drawn. The three input projections are unaffected, which is
+        what a scaling applied only to the projection writing back into a residual stream needs. Xavier
+        normal when omitted, as for any other weight.
+
+    Examples
+    --------
+    Attend over a sequence with several heads at once, taking ``(batch, time, n_embd)``. Set
+    ``n_kv_head`` below ``n_head`` for grouped-query attention, which shrinks the key/value cache that
+    dominates memory at inference:
+
+    .. code-block:: python
+
+        from pytensor_ml.layers import Input, MultiheadAttention
+
+        X = Input("X", shape=(None, 128, 256))
+        attended = MultiheadAttention("attn", n_embd=256, n_head=8, n_kv_head=2)(X)
+
+    Cross-attend instead by passing a second input for the keys and values, at its own width:
+
+    .. code-block:: python
+
+        from pytensor_ml.layers import Input, MultiheadAttention
+
+        X = Input("X", shape=(None, 128, 256))
+        context = Input("context", shape=(None, 77, 512))
+        attended = MultiheadAttention("attn", n_embd=256, n_head=8, kv_dim=512)(X, context)
     """
 
     def __init__(
         self,
-        name: str | None,
+        name: str | None = None,
+        *,
         n_embd: int,
         n_head: int,
         n_kv_head: int | None = None,
+        kv_dim: int | None = None,
+        fused_qkv: bool = False,
         bias: bool = True,
         is_causal: bool = False,
+        out_proj_initializer: Initializer | None = None,
     ):
         if n_embd % n_head != 0:
             raise ValueError(f"n_embd ({n_embd}) must be divisible by n_head ({n_head})")
@@ -169,17 +229,50 @@ class MultiheadAttention(Layer):
         if n_head % n_kv_head != 0:
             raise ValueError(f"n_head ({n_head}) must be divisible by n_kv_head ({n_kv_head})")
 
-        self.name = name if name else "MultiheadAttention"
+        self.name = _resolve_layer_name(name, type(self).__name__, "n_embd")
         self.n_embd = n_embd
         self.n_head = n_head
         self.n_kv_head = n_kv_head
         self.head_dim = n_embd // n_head
+        self.kv_dim = kv_dim if kv_dim is not None else n_embd
         self.is_causal = is_causal
+        self.fused_qkv = fused_qkv
 
-        self.q_proj = Linear(f"{self.name}_q_proj", n_embd, n_head * self.head_dim, bias)
-        self.k_proj = Linear(f"{self.name}_k_proj", n_embd, n_kv_head * self.head_dim, bias)
-        self.v_proj = Linear(f"{self.name}_v_proj", n_embd, n_kv_head * self.head_dim, bias)
-        self.out_proj = Linear(f"{self.name}_out_proj", n_head * self.head_dim, n_embd, bias)
+        if fused_qkv and self.kv_dim != n_embd:
+            raise ValueError(
+                f"{self.name} cannot project a {self.kv_dim}-wide key/value input through a weight "
+                f"shared with {n_embd}-wide queries, so fused_qkv and kv_dim are mutually exclusive."
+            )
+
+        self.q_width = n_head * self.head_dim
+        self.kv_width = n_kv_head * self.head_dim
+
+        self.qkv_proj: Linear | None = None
+        self.q_proj: Linear | None = None
+        self.k_proj: Linear | None = None
+        self.v_proj: Linear | None = None
+        if fused_qkv:
+            self.qkv_proj = Linear(
+                f"{self.name}_qkv_proj",
+                n_in=n_embd,
+                n_out=self.q_width + 2 * self.kv_width,
+                bias=bias,
+            )
+        else:
+            self.q_proj = Linear(f"{self.name}_q_proj", n_in=n_embd, n_out=self.q_width, bias=bias)
+            self.k_proj = Linear(
+                f"{self.name}_k_proj", n_in=self.kv_dim, n_out=self.kv_width, bias=bias
+            )
+            self.v_proj = Linear(
+                f"{self.name}_v_proj", n_in=self.kv_dim, n_out=self.kv_width, bias=bias
+            )
+        self.out_proj = Linear(
+            f"{self.name}_out_proj",
+            n_in=n_head * self.head_dim,
+            n_out=n_embd,
+            bias=bias,
+            weight_initializer=out_proj_initializer,
+        )
 
     def _split_heads(self, x: pt.TensorVariable, n_head: int) -> pt.TensorVariable:
         # (..., seq, n_head * head_dim) -> (..., n_head, seq, head_dim). split_dims keeps the static
@@ -187,12 +280,54 @@ class MultiheadAttention(Layer):
         # vectorize_graph) instead of falling back to object mode.
         return pt.split_dims(x, shape=(n_head, self.head_dim), axis=-1).swapaxes(-3, -2)
 
-    def __call__(self, x: pt.TensorLike, mask: pt.TensorLike | None = None) -> pt.TensorVariable:
-        x = pt.as_tensor(x)
+    def __call__(
+        self,
+        x: pt.TensorLike,
+        kv: pt.TensorLike | None = None,
+        mask: pt.TensorLike | None = None,
+    ) -> pt.TensorVariable:
+        """
+        Attend over ``x``, of shape ``(batch, seq, n_embd)``.
 
-        q = self._split_heads(self.q_proj(x), self.n_head)
-        k = self._split_heads(self.k_proj(x), self.n_kv_head)
-        v = self._split_heads(self.v_proj(x), self.n_kv_head)
+        Parameters
+        ----------
+        x : TensorLike
+            Input the queries are projected from.
+        kv : TensorLike, optional
+            Input the keys and values are projected from, of width ``kv_dim`` and any sequence
+            length. Defaults to ``x``, which is self-attention.
+        mask : TensorLike, optional
+            Additive mask broadcast over the attention scores.
+
+        Returns
+        -------
+        attended : TensorVariable
+            Shape ``(batch, seq, n_embd)``.
+        """
+        if kv is not None and self.fused_qkv:
+            raise ValueError(
+                f"{self.name} projects keys and values from the same weight as queries, so they "
+                f"cannot come from a second input; fused_qkv and kv are mutually exclusive."
+            )
+        if kv is not None and self.is_causal:
+            raise ValueError(
+                f"{self.name} cannot mask against earlier positions of a sequence it is not "
+                f"attending over, so is_causal and kv are mutually exclusive."
+            )
+
+        x = pt.as_tensor(x)
+        kv = x if kv is None else pt.as_tensor(kv)
+
+        if self.qkv_proj is not None:
+            widths = [self.q_width, self.kv_width, self.kv_width]
+            queries, key_states, value_states = pt.split(self.qkv_proj(x), widths, axis=-1)
+        else:
+            assert self.q_proj is not None and self.k_proj is not None and self.v_proj is not None
+            queries, key_states, value_states = self.q_proj(x), self.k_proj(kv), self.v_proj(kv)
+
+        q = self._split_heads(queries, self.n_head)
+        k = self._split_heads(key_states, self.n_kv_head)
+        v = self._split_heads(value_states, self.n_kv_head)
 
         if mask is not None:
             mask = pt.as_tensor(mask)
@@ -225,23 +360,40 @@ class CausalSelfAttention(MultiheadAttention):
         Number of key/value heads, for grouped-query attention. Defaults to ``n_head``.
     bias : bool, optional
         Include bias terms in the projections. Default is True.
+    out_proj_initializer : Initializer, optional
+        How the output projection's weight is drawn. See :class:`MultiheadAttention`.
+
+    Examples
+    --------
+    :class:`MultiheadAttention` with the causal mask always on, so no position sees a later one. This is
+    the decoder-side layer a language model stacks:
+
+    .. code-block:: python
+
+        from pytensor_ml.layers import CausalSelfAttention, Input
+
+        X = Input("X", shape=(None, 128, 256))
+        attended = CausalSelfAttention("attn", n_embd=256, n_head=8)(X)
     """
 
     def __init__(
         self,
-        name: str | None,
+        name: str | None = None,
+        *,
         n_embd: int,
         n_head: int,
         n_kv_head: int | None = None,
         bias: bool = True,
+        out_proj_initializer: Initializer | None = None,
     ):
         super().__init__(
-            name if name else "CausalSelfAttention",
-            n_embd,
-            n_head,
+            name,
+            n_embd=n_embd,
+            n_head=n_head,
             n_kv_head=n_kv_head,
             bias=bias,
             is_causal=True,
+            out_proj_initializer=out_proj_initializer,
         )
 
 

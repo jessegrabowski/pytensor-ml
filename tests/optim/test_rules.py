@@ -1,9 +1,13 @@
 import inspect
 
 import numpy as np
+import pytensor
 import pytensor.tensor as pt
 import pytest
 
+from pytensor.gradient import DisconnectedInputError, grad
+
+from pytensor_ml import params
 from pytensor_ml.optim import (
     adadelta,
     adadelta_updates,
@@ -15,6 +19,8 @@ from pytensor_ml.optim import (
     adamax_updates,
     adamw,
     adamw_updates,
+    compile_train,
+    cosine_schedule,
     nadam,
     nadam_updates,
     rmsprop,
@@ -25,8 +31,17 @@ from pytensor_ml.optim import (
     sgd_updates,
 )
 from pytensor_ml.optim import alias as alias_module
-from pytensor_ml.params import trainable
 from pytensor_ml.pytensorf import function
+
+floatX = pytensor.config.floatX
+
+# The closed-form step identities below are exact in real arithmetic, so the gap is pure rounding.
+RTOL = 1e-6 if floatX == "float64" else 1e-4
+
+
+def trainable(value, name=None, **kwargs):
+    """Create a parameter at floatX; a float64 literal would not match the gradients it is updated with."""
+    return params.trainable(np.asarray(value, dtype=floatX), name=name, **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -112,7 +127,7 @@ def test_sgd_momentum_follows_closed_form_trajectory(nesterov):
     start = np.array([5.0, -3.0])
     p = trainable(start.copy(), name="w")
     g0 = np.array([2.0, -0.5])
-    loss = (pt.constant(g0) * p).sum()  # constant gradient g0, independent of p
+    loss = (pt.constant(g0, dtype=floatX) * p).sum()  # constant gradient g0, independent of p
     lr, momentum, n_steps = 0.1, 0.9, 5
     rule = sgd(learning_rate=lr, momentum=momentum, nesterov=nesterov)
     fn = function([], loss, updates=rule(loss, [p]))
@@ -123,7 +138,7 @@ def test_sgd_momentum_follows_closed_form_trajectory(nesterov):
         current = p.get_value()
         exponent = t + 1 if nesterov else t
         expected_step = -lr * g0 * (1 - momentum**exponent) / (1 - momentum)
-        np.testing.assert_allclose(current - previous, expected_step, rtol=1e-6)
+        np.testing.assert_allclose(current - previous, expected_step, rtol=RTOL)
         previous = current
 
 
@@ -138,18 +153,141 @@ def test_adam_first_step_is_sign_descent():
     function([], loss, updates=adam_updates(loss, [p], learning_rate=lr))()
 
     step = start - p.get_value()
-    np.testing.assert_allclose(step, lr * np.sign(start), rtol=1e-6)
+    np.testing.assert_allclose(step, lr * np.sign(start), rtol=RTOL)
+
+
+def test_rule_updates_advance_their_counter_without_compile_train():
+    """adam_updates has to stand on its own: bias correction reads the counter, so a caller who compiles the
+    updates directly must get an advancing count rather than one frozen at the first step."""
+    p = trainable(np.zeros(3), name="w")
+    loss = (p**2).sum()
+    updates = adam_updates(loss, [p])
+    clock = next(key for key in updates if key.name == "adam/step_count")
+
+    step = function([], loss, updates=updates)
+    step()
+    step()
+
+    assert int(clock.get_value()) == 2
 
 
 def test_adam_updates_keyed_by_object_with_named_state():
     """State is discovered by object identity; names exist only for serialization."""
     p = trainable(np.zeros(3), name="w")
     loss = (p**2).sum()
-    updates = adam_updates(loss, [p])
+    updates = adam_updates(loss, [p], amsgrad=True)
 
     assert p in updates  # the exact param object is a key, not a renamed copy
     state_names = {key.name for key in updates if key is not p}
-    assert state_names == {"adam/step_count", "w/adam/first_moment", "w/adam/second_moment"}
+    assert state_names == {
+        "adam/step_count",
+        "w/adam/first_moment",
+        "w/adam/second_moment",
+        "w/adam/max_second_moment",
+    }
+
+
+def test_adamw_names_its_own_state():
+    """adamw keeps adam's moments but not adam's names: a rule-wide name shared between two rules collides
+    when both appear in one training step, and reads as adam's state in a checkpoint."""
+    p = trainable(np.zeros(3), name="w")
+    loss = (p**2).sum()
+    updates = adamw_updates(loss, [p], amsgrad=True)
+
+    state_names = {key.name for key in updates if key is not p}
+    assert state_names == {
+        "adamw/step_count",
+        "w/adamw/first_moment",
+        "w/adamw/second_moment",
+        "w/adamw/max_second_moment",
+    }
+
+
+def test_adam_and_adamw_in_one_step_keep_separate_state():
+    """The collision the name test above describes in prose, actually run. Both rules derive every slot from
+    one namespace argument, so a namespace that defaulted or went missing would hand them the same memoized
+    buffers -- and sharing a step counter is invisible, since both write the same increment to it."""
+    by_adam = trainable(np.array([1.0, -2.0]), name="by_adam")
+    by_adamw = trainable(np.array([1.0, -2.0]), name="by_adamw")
+    loss = 0.5 * (by_adam**2).sum() + 0.5 * (by_adamw**2).sum()
+
+    adam_state = adam_updates(loss, [by_adam], learning_rate=0.1, amsgrad=True)
+    adamw_state = adamw_updates(loss, [by_adamw], learning_rate=0.1, amsgrad=True)
+
+    assert not set(adam_state) & set(
+        adamw_state
+    )  # not one buffer between them, including the counter
+    function([], loss, updates={**adam_state, **adamw_state})()
+
+    counters = {
+        key.name: key.get_value()
+        for key in (*adam_state, *adamw_state)
+        if key.name.endswith("step_count")
+    }
+    assert counters == {"adam/step_count": 1, "adamw/step_count": 1}
+
+
+def test_two_rules_of_one_kind_keep_separate_state_when_named():
+    """Two groups on the same rule is the ordinary reason to want two rules, and every slot the rule keeps
+    hangs off its namespace -- including the step counter, which is one variable for the whole rule rather
+    than one per parameter, so it is the slot that actually collides."""
+    weights = trainable(np.array([1.0, -2.0]), name="weights")
+    biases = trainable(np.array([0.5]), name="biases")
+    loss = 0.5 * (weights**2).sum() + 0.5 * (biases**2).sum()
+
+    on_weights = adam_updates(loss, [weights], learning_rate=0.1, namespace="fast")
+    on_biases = adam_updates(loss, [biases], learning_rate=0.01, namespace="slow")
+
+    assert not set(on_weights) & set(on_biases)
+    function([], loss, updates={**on_weights, **on_biases})()
+
+    counters = {
+        key.name: key.get_value()
+        for key in (*on_weights, *on_biases)
+        if key.name.endswith("step_count")
+    }
+    assert counters == {"fast/step_count": 1, "slow/step_count": 1}
+
+
+@pytest.mark.parametrize(
+    "rule_updates, name",
+    [
+        (adam_updates, "adam"),
+        (adamw_updates, "adamw"),
+        (nadam_updates, "nadam"),
+        (adamax_updates, "adamax"),
+        (adagrad_updates, "adagrad"),
+        (rmsprop_updates, "rmsprop"),
+        (adadelta_updates, "adadelta"),
+        (rprop_updates, "rprop"),
+    ],
+    ids=lambda value: value if isinstance(value, str) else "",
+)
+def test_a_rule_names_its_state_after_itself_by_default(rule_updates, name):
+    """The default has to stay the rule's own name: it is what a checkpoint written before ``namespace``
+    existed is keyed on. Plain sgd keeps no state of its own, so it is covered through its alias."""
+    parameter = trainable(np.array([1.0, -2.0]), name="w")
+    loss = (parameter**2).sum()
+
+    updates = rule_updates(loss, [parameter])
+
+    slots = {key.name for key in updates if key is not parameter}
+    assert slots, f"{name} keeps no state to name"
+    assert all(slot.split("/")[-2] == name for slot in slots), slots
+
+
+def test_sgd_names_the_step_counter_its_schedule_reads():
+    """sgd allocates no state of its own, so its namespace shows up only on the counter the alias keeps
+    for a schedule to read -- which is the slot two sgd rules in one step would collide on."""
+    parameter = trainable(np.array([1.0, -2.0]), name="w")
+    loss = (parameter**2).sum()
+
+    step = compile_train(loss, sgd(cosine_schedule(0.1, 10), namespace="fast"), inputs=[])
+
+    counters = [
+        str(shared.name) for shared in step.get_shared() if str(shared.name).endswith("step_count")
+    ]
+    assert counters == ["fast/step_count"]
 
 
 @pytest.mark.parametrize(
@@ -178,7 +316,7 @@ def test_two_functions_from_one_rule_continue_the_same_momentum():
     ``lr * g * (1 - m**t) / (1 - m)``, so a continued second step is 1.9x a restarted one at ``m = 0.9``."""
     p = trainable(np.zeros(2), name="w")
     gradient = np.array([2.0, -0.5])
-    loss = (pt.constant(gradient) * p).sum()  # constant gradient, independent of p
+    loss = (pt.constant(gradient, dtype=floatX) * p).sum()  # constant gradient, independent of p
     learning_rate, momentum = 0.1, 0.9
     rule = sgd(learning_rate=learning_rate, momentum=momentum)
 
@@ -190,7 +328,7 @@ def test_two_functions_from_one_rule_continue_the_same_momentum():
     step_again()
 
     continued = -learning_rate * gradient * (1 - momentum**2) / (1 - momentum)
-    np.testing.assert_allclose(p.get_value() - before, continued, rtol=1e-6)
+    np.testing.assert_allclose(p.get_value() - before, continued, rtol=RTOL)
 
 
 def test_separately_configured_rules_keep_independent_state():
@@ -219,7 +357,7 @@ def test_adamw_first_step_applies_decoupled_decay():
     )()
 
     step = p.get_value() - start
-    np.testing.assert_allclose(step, -lr * (np.sign(start) + weight_decay * start), rtol=1e-6)
+    np.testing.assert_allclose(step, -lr * (np.sign(start) + weight_decay * start), rtol=RTOL)
 
 
 def test_adamw_mask_excludes_parameters_from_decay():
@@ -239,8 +377,28 @@ def test_adamw_mask_excludes_parameters_from_decay():
     )
     function([], loss, updates=updates)()
 
-    np.testing.assert_allclose(w.get_value() - 2.0, -lr * (1.0 + weight_decay * 2.0), rtol=1e-6)
-    np.testing.assert_allclose(b.get_value() - 2.0, -lr * 1.0, rtol=1e-6)
+    np.testing.assert_allclose(w.get_value() - 2.0, -lr * (1.0 + weight_decay * 2.0), rtol=RTOL)
+    np.testing.assert_allclose(b.get_value() - 2.0, -lr * 1.0, rtol=RTOL)
+
+
+def test_adamw_without_decay_is_adam():
+    """The decoupled decay term is the *only* difference between the two rules, which is what lets them share
+    an implementation. Run over enough steps that the moments, the bias corrections and the accumulated
+    trajectory all have to agree, and compare exactly: with no decay these are meant to be the same
+    computation, not merely close, so the two drifting apart at all means they stopped sharing it."""
+    start = np.array([1.5, -0.5, 2.0])
+    by_adam = trainable(start.copy(), name="by_adam")
+    by_adamw = trainable(start.copy(), name="by_adamw")
+
+    adam_step = function([], [], updates=adam_updates(0.5 * (by_adam**2).sum(), [by_adam]))
+    adamw_step = function(
+        [], [], updates=adamw_updates(0.5 * (by_adamw**2).sum(), [by_adamw], weight_decay=0.0)
+    )
+    for _ in range(20):
+        adam_step()
+        adamw_step()
+
+    np.testing.assert_array_equal(by_adamw.get_value(), by_adam.get_value())
 
 
 def test_adagrad_step_decays_as_inverse_sqrt_t():
@@ -249,7 +407,7 @@ def test_adagrad_step_decays_as_inverse_sqrt_t():
     start = np.array([5.0, -3.0])
     p = trainable(start.copy(), name="w")
     g0 = np.array([2.0, -0.5])  # 4x apart, yet both coordinates take the same step size
-    loss = (pt.constant(g0) * p).sum()  # constant gradient g0, independent of p
+    loss = (pt.constant(g0, dtype=floatX) * p).sum()  # constant gradient g0, independent of p
     lr, n_steps = 0.1, 6
     fn = function([], loss, updates=adagrad_updates(loss, [p], learning_rate=lr))
 
@@ -323,7 +481,7 @@ def test_rmsprop_momentum_converges_to_terminal_velocity():
     start = np.array([10.0, -10.0])
     p = trainable(start.copy(), name="w")
     g0 = np.array([2.0, -0.5])
-    loss = (pt.constant(g0) * p).sum()  # constant gradient g0, independent of p
+    loss = (pt.constant(g0, dtype=floatX) * p).sum()  # constant gradient g0, independent of p
     lr, momentum, n_steps = 1e-3, 0.9, 200
     fn = function([], loss, updates=rmsprop_updates(loss, [p], learning_rate=lr, momentum=momentum))
 
@@ -346,7 +504,7 @@ def test_nadam_first_step_scales_by_one_plus_beta1():
     function([], loss, updates=nadam_updates(loss, [p], learning_rate=lr, beta1=beta1))()
 
     step = start - p.get_value()
-    np.testing.assert_allclose(step, lr * (1 + beta1) * np.sign(start), rtol=1e-6)
+    np.testing.assert_allclose(step, lr * (1 + beta1) * np.sign(start), rtol=RTOL)
 
 
 def test_adamax_takes_constant_step_under_constant_gradient():
@@ -356,7 +514,7 @@ def test_adamax_takes_constant_step_under_constant_gradient():
     start = np.array([5.0, -3.0])
     p = trainable(start.copy(), name="w")
     g0 = np.array([2.0, -0.5])  # 4x apart, yet both coordinates take the same step size
-    loss = (pt.constant(g0) * p).sum()  # constant gradient g0, independent of p
+    loss = (pt.constant(g0, dtype=floatX) * p).sum()  # constant gradient g0, independent of p
     lr, n_steps = 0.1, 6
     fn = function([], loss, updates=adamax_updates(loss, [p], learning_rate=lr))
 
@@ -375,7 +533,7 @@ def test_rprop_step_grows_geometrically_under_constant_sign():
     start = np.array([5.0, -3.0])
     p = trainable(start.copy(), name="w")
     g0 = np.array([2.0, -0.5])  # 4x apart, yet both coordinates take the same step size
-    loss = (pt.constant(g0) * p).sum()  # constant gradient g0, independent of p
+    loss = (pt.constant(g0, dtype=floatX) * p).sum()  # constant gradient g0, independent of p
     lr, eta_plus, n_steps = 0.01, 1.2, 5
     fn = function([], loss, updates=rprop_updates(loss, [p], learning_rate=lr, eta_plus=eta_plus))
 
@@ -383,7 +541,7 @@ def test_rprop_step_grows_geometrically_under_constant_sign():
     for t in range(1, n_steps + 1):
         fn()
         current = p.get_value()
-        np.testing.assert_allclose(np.abs(current - previous), lr * eta_plus ** (t - 1), rtol=1e-6)
+        np.testing.assert_allclose(np.abs(current - previous), lr * eta_plus ** (t - 1), rtol=RTOL)
         previous = current
 
 
@@ -410,15 +568,19 @@ def test_amsgrad_caps_step_after_gradient_spike():
     second moment lets the effective step size grow back."""
     g = pt.vector("g")
 
+    spike = np.array([10.0], dtype=floatX)
+    # 1e-3 is not exact in float32, so pytensor rejects the bare literal rather than downcasting it.
+    settled = np.array([1e-3], dtype=floatX)
+
     def step_after_spike(amsgrad):
         p = trainable(np.zeros(1), name="w")
         updates = adam_updates([g], [p], learning_rate=0.1, beta2=0.9, amsgrad=amsgrad)
         fn = function([g], p, updates=updates)
-        fn([10.0])
+        fn(spike)
         for _ in range(20):
-            fn([1e-3])
+            fn(settled)
         before = p.get_value().copy()
-        fn([1e-3])
+        fn(settled)
         return np.abs(p.get_value() - before)[0]
 
     assert step_after_spike(amsgrad=True) < step_after_spike(amsgrad=False)
@@ -426,7 +588,7 @@ def test_amsgrad_caps_step_after_gradient_spike():
 
 def test_precomputed_gradients_accepted():
     p = trainable(np.ones(2), name="w")
-    gradients = [pt.constant(np.array([0.5, -0.5]))]
+    gradients = [pt.constant(np.array([0.5, -0.5], dtype=floatX))]
     updates = sgd(learning_rate=1.0)(gradients, [p])
     np.testing.assert_allclose(function([], updates[p])(), [0.5, 1.5])
 
@@ -434,6 +596,30 @@ def test_precomputed_gradients_accepted():
 def test_get_gradients_rejects_count_mismatch():
     weight = trainable(np.ones(2), name="w")
     bias = trainable(np.ones(2), name="b")
-    one_gradient = [pt.constant(np.ones(2))]
+    one_gradient = [pt.constant(np.ones(2, dtype=floatX))]
     with pytest.raises(ValueError, match="1 gradients for 2 parameters"):
         sgd_updates(one_gradient, [weight, bias])
+
+
+def test_get_gradients_names_the_parameters_the_loss_cannot_reach():
+    """Pytensor raises with an empty message here, which says nothing about which parameter is at fault."""
+    reachable = trainable(np.ones(2), name="reachable")
+    unreachable = trainable(np.ones(2), name="unreachable")
+    loss = (reachable**2).sum()
+
+    with pytest.raises(DisconnectedInputError, match=r"\['unreachable'\]"):
+        sgd_updates(loss, [reachable, unreachable])
+
+
+def test_get_gradients_names_a_parameter_lost_to_a_second_derivative():
+    """The shape a PINN hits: an output bias is additive in the network output, so it survives in the loss as
+    written and vanishes once the loss differentiates twice with respect to the input."""
+    x = pt.scalar("x")
+    weight = trainable(1.0, name="weight")
+    scale = trainable(1.0, name="scale")
+    output_bias = trainable(1.0, name="output_bias")
+    u = pt.tanh(x * weight) * scale + output_bias
+    loss = grad(grad(u, x), x) ** 2
+
+    with pytest.raises(DisconnectedInputError, match=r"\['output_bias'\]"):
+        sgd_updates(loss, [weight, scale, output_bias])

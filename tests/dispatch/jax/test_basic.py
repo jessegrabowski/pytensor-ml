@@ -11,9 +11,7 @@ from pytensor.link.jax.linker import JAXLinker
 
 jax = pytest.importorskip("jax")
 
-# The JAX mode's own optimizer, not a hand-built ``include=["jax"]`` query. A narrower query skips
-# canonicalize, so ops that reach the backend only after being rewritten -- SplitDims and JoinDims
-# become Reshape, for instance -- raise "No JAX conversion" here while compiling fine in real use.
+# Include canonicalization for ops that lower to supported primitives before JAX dispatch.
 jax_mode = Mode(linker=JAXLinker(), optimizer=JAX._optimizer)
 py_mode = Mode(linker="py", optimizer=None)
 

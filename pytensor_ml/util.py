@@ -23,6 +23,23 @@ class DataLoader:
         Dtype to cast ``X`` and ``y`` to. Defaults to ``floatX``.
     random_state : int or numpy Generator, optional
         Seed for the shuffling generator, for reproducible batch sequences.
+
+    Examples
+    --------
+    Call the loader once per training step; it reshuffles and wraps around on its own, so the loop
+    never has to track epoch boundaries:
+
+    .. code-block:: python
+
+        import numpy as np
+
+        from pytensor_ml.util import DataLoader
+
+        X = np.random.default_rng(0).normal(size=(500, 8))
+        y = np.random.default_rng(1).normal(size=(500, 1))
+
+        loader = DataLoader(X, y, batch_size=32, random_state=0)
+        X_batch, y_batch = loader()
     """
 
     def __init__(self, X, y, batch_size=64, dtype=None, random_state=None):

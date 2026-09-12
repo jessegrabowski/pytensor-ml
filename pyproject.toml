@@ -10,7 +10,8 @@ description = "A(nother) deep learning library, built on top of Pytensor"
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [{name="Jesse Grabowski", email='jessegrabowski@gmail.com'}, {name="Ricardo Vieira"}]
-license = { file = "LICENSE" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
   "Intended Audience :: Science/Research",
@@ -40,9 +41,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/pymc-devs/pytensor_ml"
-Source = "https://github.com/pymc-devs/pytensor_ml"
-Tracker = "https://github.com/pymc-devs/pytensor_ml/issues"
+Homepage = "https://github.com/pymc-devs/pytensor-ml"
+Documentation = "https://pytensor-ml.readthedocs.io"
+Source = "https://github.com/pymc-devs/pytensor-ml"
+Tracker = "https://github.com/pymc-devs/pytensor-ml/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -52,6 +54,11 @@ dev = [
     "scikit-learn",
     "mypy",
     "jax",
+    "pyyaml",
+]
+examples = [
+    "matplotlib",
+    "tqdm",
 ]
 
 [tool.hatch.version]
@@ -64,6 +71,12 @@ version-file = "pytensor_ml/_version.py"
 [tool.pytest.ini_options]
 minversion = "6.0"
 xfail_strict=true
+# A checkpoint test reads a published snapshot of several GB from disk, so it runs only when asked
+# for: `pytest -m checkpoint`.
+addopts = "-m 'not checkpoint'"
+markers = [
+    "checkpoint: needs a full published checkpoint on disk, not a fixture",
+]
 filterwarnings = [
     "error",
     'ignore:\nArviZ is undergoing a major refactor.*:FutureWarning',
@@ -71,6 +84,13 @@ filterwarnings = [
     # warnings filter per-test and undoes it. Numba emits it from the numba
     # linker, which is pytensor 3's default.
     "ignore::numba.core.errors.NumbaPerformanceWarning",
+    # torch.compile pulls in inductor, which imports torch.utils.mkldnn, whose class bodies still call
+    # the deprecated torch.jit.script_method. Raising here aborts the import half-done, so every later
+    # torch-mode test retries it and fails the same way. The message past this prefix depends on the
+    # Python version.
+    "ignore:`torch.jit.script_method` is:DeprecationWarning",
+    # pytensor hands torch its constants as the read-only numpy arrays it stores them in.
+    "ignore:The given NumPy array is not writable:UserWarning",
 ]
 
 [tool.ruff]
@@ -132,3 +152,51 @@ warn_unused_ignores = true
 warn_return_any = false
 warn_unreachable = true
 files = ["pytensor_ml"]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64", "win-64"]
+
+# Autodoc imports pytensor_ml, so the docs environment needs the runtime stack alongside sphinx.
+# Read the Docs cannot read a pixi environment, so it builds from conda_envs/environment-docs.yml;
+# the two lists have to move together.
+[tool.pixi.feature.docs.dependencies]
+python = ">=3.12"
+pytensor = ">=3.3.0,<3.4.0"
+numpy = "*"
+safetensors = "*"
+# The gallery extension renders notebook thumbnails with matplotlib.
+matplotlib = "*"
+ipython = "*"
+jupyter = "*"
+sphinx = ">=7"
+pydata-sphinx-theme = "*"
+myst-nb = "*"
+numpydoc = "*"
+sphinx-copybutton = "*"
+sphinx-design = "*"
+sphinx-codeautolink = "*"
+sphinx-sitemap = "*"
+sphinx-notfound-page = "*"
+sphinx-autobuild = "*"
+jupyter-sphinx = "*"
+sphinxcontrib-bibtex = "*"
+
+[tool.pixi.feature.docs.pypi-dependencies]
+pytensor_ml = { path = ".", editable = true }
+
+[tool.pixi.feature.docs.tasks]
+docs-build = { cmd = "sphinx-build -b html source build/html", cwd = "docs" }
+# Rebuilds on save and serves the result at http://localhost:8000. The ignored paths are the ones a
+# build writes back into source/ -- the gallery pages and staged notebooks, their thumbnails, and the
+# autosummary stubs -- which would otherwise retrigger the watcher and rebuild forever. They are the
+# same set docs/.gitignore lists, and have to move together.
+docs-serve = { cmd = """\
+    sphinx-autobuild source build/html --port 8000 --open-browser \
+    --ignore '*/source/examples/*' \
+    --ignore '*/source/_thumbnails/*' \
+    --ignore '*/source/api/generated/*'\
+""", cwd = "docs" }
+
+[tool.pixi.environments]
+docs = { features = ["docs"] }

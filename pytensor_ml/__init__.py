@@ -2,6 +2,8 @@ import logging
 import sys
 
 import pytensor_ml.dispatch  # installs the lazy backend-dispatch registration hook
+import pytensor_ml.rewriting.conv  # registers the convolution rewrites into pytensor's databases
+import pytensor_ml.rewriting.layers  # registers the degenerate-dropout rewrite into pytensor's databases
 
 from pytensor_ml._version import __version__
 from pytensor_ml.checkpoint import load_state, save_state

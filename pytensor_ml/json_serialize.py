@@ -15,6 +15,8 @@ from pytensor_ml.serialize.base import (
     op_to_json,
     prop_from_json,
     prop_to_json,
+    props_from_json,
+    props_to_json,
     qualname,
     register_from_json,
     register_type,
@@ -38,7 +40,7 @@ def serialize_graph(inputs: Sequence[Variable], outputs: Sequence[Variable]) -> 
 
     Returns
     -------
-    dict
+    serialized_graph : dict
         A JSON-native description of the graph's structure (no parameter values).
     """
     return graph_to_json(list(inputs), list(outputs))
@@ -79,6 +81,8 @@ __all__ = [
     "op_to_json",
     "prop_from_json",
     "prop_to_json",
+    "props_from_json",
+    "props_to_json",
     "qualname",
     "register_from_json",
     "register_type",

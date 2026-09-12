@@ -3,8 +3,31 @@ import pytensor.tensor as pt
 
 from pytensor import config
 
-from pytensor_ml.base import Layer, LayerOp, UnaryLayerOp
+from pytensor_ml.base import Layer, LayerOp, UnaryLayerOp, _resolve_layer_name
 from pytensor_ml.params import NonTrainableParameter, TrainableParameter, non_trainable, trainable
+from pytensor_ml.state import Initializer, OneInitializer, ZeroInitializer
+
+
+def _batch_axes(X: pt.TensorVariable) -> tuple[int, ...]:
+    """Every axis a batch statistic is taken over, which is all of them but the feature axis at the end."""
+    return tuple(range(X.ndim - 1))
+
+
+def _accumulator_dtype(X) -> str:
+    """The width a normalization's statistics accumulate at.
+
+    Squaring a float16 activation overflows past :math:`|x|` of about 256, so the statistics are
+    taken wider than the input and cast back.
+    """
+    return "float32" if X.dtype in ("float16", "bfloat16") else X.dtype
+
+
+def _root_mean_square(X, epsilon):
+    """Scale ``X`` by its root mean square over the last axis, leaving its mean where it is."""
+    wide = X.astype(_accumulator_dtype(X))
+    mean_square = pt.mean(pt.square(wide), axis=-1, keepdims=True)
+
+    return (wide / pt.sqrt(mean_square + epsilon)).astype(X.dtype)
 
 
 def _standardize(X, epsilon, axis, keepdims=False):
@@ -26,9 +49,13 @@ def _standardize(X, epsilon, axis, keepdims=False):
     sigma_sq : TensorVariable
         Biased variance of ``X`` over ``axis``.
     """
-    mu = X.mean(axis=axis, keepdims=keepdims)
-    sigma_sq = X.var(axis=axis, keepdims=keepdims)
-    return (X - mu) / pt.sqrt(sigma_sq + epsilon), mu, sigma_sq
+    wide = X.astype(_accumulator_dtype(X))
+
+    mu = wide.mean(axis=axis, keepdims=keepdims)
+    sigma_sq = wide.var(axis=axis, keepdims=keepdims)
+    standardized = (wide - mu) / pt.sqrt(sigma_sq + epsilon)
+
+    return standardized.astype(X.dtype), mu.astype(X.dtype), sigma_sq.astype(X.dtype)
 
 
 def _affine_input_count(affine: bool) -> int:
@@ -75,12 +102,38 @@ def _resolve_n_in(name: str, n_in: int | None, X: pt.TensorVariable | None) -> i
     return inferred
 
 
-def _affine_parameters(name: str, n_in: int) -> tuple[TrainableParameter, TrainableParameter]:
+def _norm_parameter(
+    name: str, suffix: str, n_in: int, initializer: Initializer | None, default: Initializer
+) -> TrainableParameter:
+    """Build one of a norm layer's learned vectors, named ``{name}_{suffix}``.
+
+    It declares its initializer, so a redraw returns it to the identity transform -- normalizing and then
+    rescaling by a random factor defeats the point of the layer. A caller who wants something else says so,
+    and their choice becomes the declaration.
+    """
+    resolved = default if initializer is None else initializer
+
+    return trainable(
+        resolved.initial_value((n_in,)),
+        f"{name}_{suffix}",
+        initializer=resolved,
+        layer_name=name,
+    )
+
+
+def _affine_parameters(
+    name: str,
+    n_in: int,
+    loc_initializer: Initializer | None = None,
+    scale_initializer: Initializer | None = None,
+) -> tuple[TrainableParameter, TrainableParameter]:
     """Build the learned shift and scale. Returns them in the ``(loc, scale)`` order that every norm
-    op unpacks its inputs in, so the two cannot drift apart."""
-    loc = trainable(np.zeros(n_in, dtype=config.floatX), f"{name}_loc")
-    scale = trainable(np.ones(n_in, dtype=config.floatX), f"{name}_scale")
-    return loc, scale
+    op unpacks its inputs in, so the two cannot drift apart.
+    """
+    return (
+        _norm_parameter(name, "loc", n_in, loc_initializer, ZeroInitializer()),
+        _norm_parameter(name, "scale", n_in, scale_initializer, OneInitializer()),
+    )
 
 
 class BatchNormLayer(LayerOp):
@@ -94,7 +147,7 @@ class BatchNormLayer(LayerOp):
 
     def build_inner_graph(self, X, *rest):
         affine_params, (running_mean, running_var) = _split_affine(self.affine, rest)
-        X_normalized, mu, sigma_sq = _standardize(X, self.epsilon, axis=0)
+        X_normalized, mu, sigma_sq = _standardize(X, self.epsilon, axis=_batch_axes(X))
 
         new_running_mean = self.momentum * mu + (1 - self.momentum) * running_mean
         new_running_var = self.momentum * sigma_sq + (1 - self.momentum) * running_var
@@ -109,7 +162,7 @@ class NoRunningStatsBatchNormLayer(LayerOp):
         # Reports the batch statistics to match BatchNormLayer's arity; declaring no update_map is what
         # keeps them from being written back to anything.
         affine_params, _ = _split_affine(self.affine, rest)
-        X_normalized, mu, sigma_sq = _standardize(X, self.epsilon, axis=0)
+        X_normalized, mu, sigma_sq = _standardize(X, self.epsilon, axis=_batch_axes(X))
 
         return [_rescale(X_normalized, affine_params), mu, sigma_sq]
 
@@ -124,9 +177,9 @@ class PredictionBatchNormLayer(UnaryLayerOp):
         return [_rescale(X_normalized, affine_params)]
 
 
-class BatchNorm2D(Layer):
+class BatchNorm(Layer):
     r"""
-    Batch normalization over the batch axis.
+    Batch normalization over every axis but the last.
 
     Standardize each feature across the batch, then optionally apply a learned affine transform:
 
@@ -134,9 +187,12 @@ class BatchNorm2D(Layer):
 
         y = \frac{x - \mathrm{E}[x]}{\sqrt{\mathrm{Var}[x] + \epsilon}} \cdot \gamma + \beta,
 
-    where the mean and (biased) variance are taken over the batch (first) axis. During training the
-    batch statistics are used and the running mean and variance are updated toward them as
-    :math:`(1 - m)\,r + m\,b` from each batch statistic :math:`b`.
+    where the mean and (biased) variance are taken over every axis but the last, and the last axis is
+    the feature. On a flat ``(batch, features)`` input that is the batch axis alone, which is what torch
+    calls ``BatchNorm1d``; on the ``(batch, height, width, channels)`` a convolution produces it is the
+    batch and both spatial axes, giving one statistic per channel, which torch calls ``BatchNorm2d``.
+    During training the batch statistics are used and the running mean and variance are updated toward
+    them as :math:`(1 - m)\,r + m\,b` from each batch statistic :math:`b`.
 
     Parameters
     ----------
@@ -151,9 +207,17 @@ class BatchNorm2D(Layer):
         Weight :math:`m` of the current batch statistic in the running-average update. Default is
         0.1.
     affine : bool, optional
-        Apply the learned scale :math:`\gamma` and shift :math:`\beta`. Default is True.
+        Apply the learned scale :math:`\gamma` and shift :math:`\beta`, starting from the identity
+        transform :math:`\gamma = 1`, :math:`\beta = 0`, which a redraw returns them to. Default is True.
+    scale_initializer : Initializer, optional
+        How :math:`\gamma` is drawn. Ones when omitted, which is the identity transform; drawing a random
+        factor to rescale a normalized activation by would defeat the layer.
+    loc_initializer : Initializer, optional
+        How :math:`\beta` is drawn. Zeros when omitted.
     track_running_stats : bool, optional
-        Maintain running mean and variance for use at prediction time. Default is True.
+        Maintain running mean and variance for use at prediction time. If False, each batch is
+        normalized against its own sample statistics at both training and inference time.
+        Default is True.
 
     Notes
     -----
@@ -165,23 +229,48 @@ class BatchNorm2D(Layer):
     be batched with. Compile prediction graphs with :func:`compile_predict`, which applies
     :func:`rewrite_for_prediction` to substitute the accumulated running statistics for the batch
     statistics.
+
+    Examples
+    --------
+    Normalize each feature over the batch, keeping running statistics so inference does not depend on which
+    other rows happen to share the batch. :meth:`~pytensor_ml.model.Model.predict` swaps in those running
+    statistics automatically, so the training and inference graphs differ here:
+
+    .. code-block:: python
+
+        from pytensor_ml.activations import ReLU
+        from pytensor_ml.layers import BatchNorm, Input, Linear, Sequential
+
+        X = Input("X", shape=(None, 64))
+        network = Sequential(
+            Linear("fc", n_in=64, n_out=32, bias=False),
+            BatchNorm("bn", n_in=32),
+            ReLU(),
+        )
+
+        activations = network(X)
     """
 
     def __init__(
         self,
         name: str | None = None,
+        *,
         n_in: int | None = None,
         epsilon: float = 1e-5,
         momentum: float = 0.1,
         affine: bool = True,
         track_running_stats: bool = True,
+        scale_initializer: Initializer | None = None,
+        loc_initializer: Initializer | None = None,
     ):
-        self.name = name if name else "BatchNorm"
+        self.name = _resolve_layer_name(name, type(self).__name__, "n_in")
         self.n_in = n_in
         self.epsilon = epsilon
         self.momentum = momentum
         self.affine = affine
         self.track_running_stats = track_running_stats
+        self._scale_initializer = scale_initializer
+        self._loc_initializer = loc_initializer
 
         self.scale: TrainableParameter | None = None
         self.loc: TrainableParameter | None = None
@@ -202,18 +291,30 @@ class BatchNorm2D(Layer):
             return
 
         if self.affine:
-            self.loc, self.scale = _affine_parameters(self.name, n_in)
+            self.loc, self.scale = _affine_parameters(
+                self.name,
+                n_in,
+                loc_initializer=self._loc_initializer,
+                scale_initializer=self._scale_initializer,
+            )
 
         if self.track_running_stats:
             zeros = np.zeros(n_in, dtype=config.floatX)
             ones = np.ones(n_in, dtype=config.floatX)
-            self.running_mean = non_trainable(zeros, f"{self.name}_running_mean")
-            self.running_var = non_trainable(ones, f"{self.name}_running_var")
+            self.running_mean = non_trainable(
+                zeros, f"{self.name}_running_mean", layer_name=self.name
+            )
+            self.running_var = non_trainable(ones, f"{self.name}_running_var", layer_name=self.name)
 
         self.initialized = True
 
     def __call__(self, X: pt.TensorLike) -> pt.TensorVariable:
         X = pt.as_tensor(X)
+        if X.ndim < 2:
+            raise ValueError(
+                f"{self.name} takes statistics over every axis but the last, so it needs at least a "
+                f"batch axis and a feature axis; got a {X.ndim}-dimensional input."
+            )
         inputs = [X]
 
         self._initialize_params(X)
@@ -224,7 +325,17 @@ class BatchNorm2D(Layer):
 
         if self.track_running_stats:
             assert self.running_mean is not None and self.running_var is not None
-            inputs.extend([self.running_mean, self.running_var])
+            # Applying one layer object again reads what the previous application wrote, so every
+            # application contributes. The chain is built here because call order is known only while the
+            # graph is being built; two finished branches carry no order between them.
+            inputs.extend(
+                [
+                    self.new_running_mean
+                    if self.new_running_mean is not None
+                    else self.running_mean,
+                    self.new_running_var if self.new_running_var is not None else self.running_var,
+                ]
+            )
             batch_norm_op: LayerOp = BatchNormLayer(
                 name=self.name,
                 n_in=self.n_in,
@@ -283,20 +394,48 @@ class LayerNorm(Layer):
     epsilon : float, optional
         Constant :math:`\epsilon` added to the variance for numerical stability. Default is 1e-5.
     affine : bool, optional
-        Apply the learned scale :math:`\gamma` and shift :math:`\beta`. Default is True.
+        Apply the learned scale :math:`\gamma` and shift :math:`\beta`, starting from the identity
+        transform :math:`\gamma = 1`, :math:`\beta = 0`, which a redraw returns them to. Default is True.
+    scale_initializer : Initializer, optional
+        How :math:`\gamma` is drawn. Ones when omitted, which is the identity transform; drawing a random
+        factor to rescale a normalized activation by would defeat the layer.
+    loc_initializer : Initializer, optional
+        How :math:`\beta` is drawn. Zeros when omitted.
+
+    Examples
+    --------
+    Normalize each row over its own features, so no row depends on the others. That independence is why a
+    transformer uses it rather than :class:`BatchNorm`, and it needs no running statistics:
+
+    .. code-block:: python
+
+        from pytensor_ml.layers import Input, LayerNorm, Linear, Sequential
+
+        X = Input("X", shape=(None, 128, 256))
+        network = Sequential(
+            LayerNorm("ln", n_in=256),
+            Linear("fc", n_in=256, n_out=256),
+        )
+
+        activations = network(X)
     """
 
     def __init__(
         self,
         name: str | None = None,
+        *,
         n_in: int | None = None,
         epsilon: float = 1e-5,
         affine: bool = True,
+        scale_initializer: Initializer | None = None,
+        loc_initializer: Initializer | None = None,
     ):
-        self.name = name if name else "LayerNorm"
+        self.name = _resolve_layer_name(name, type(self).__name__, "n_in")
         self.n_in = n_in
         self.epsilon = epsilon
         self.affine = affine
+        self._scale_initializer = scale_initializer
+        self._loc_initializer = loc_initializer
 
         self.scale: TrainableParameter | None = None
         self.loc: TrainableParameter | None = None
@@ -313,7 +452,12 @@ class LayerNorm(Layer):
             return
 
         if self.affine:
-            self.loc, self.scale = _affine_parameters(self.name, n_in)
+            self.loc, self.scale = _affine_parameters(
+                self.name,
+                n_in,
+                loc_initializer=self._loc_initializer,
+                scale_initializer=self._scale_initializer,
+            )
 
         self.initialized = True
 
@@ -341,29 +485,29 @@ class RMSNormLayer(UnaryLayerOp):
     __props__ = ("n_in", "epsilon", "affine")
 
     def build_inner_graph(self, X, *rest):
-        epsilon = pt.constant(self.epsilon, dtype=X.type.dtype)
-        mean_square = pt.mean(pt.square(X), axis=-1, keepdims=True)
-        X_normalized = X / pt.sqrt(mean_square + epsilon)
+        normalized = _root_mean_square(X, self.epsilon)
         if not self.affine:
-            return [X_normalized]
+            return [normalized]
 
         (scale,) = rest
-        return [X_normalized * scale]
+
+        return [normalized * scale]
 
 
 class RMSNorm(Layer):
     r"""
-    Root-mean-square layer normalization over the last (feature) axis.
+    Root-mean-square normalization over the last (feature) axis.
 
-    Divide each sample by the root mean square of its own features, then optionally apply a learned
+    Rescale each sample by the root mean square of its own features, then optionally apply a learned
     scale:
 
     .. math::
 
-        y = \frac{x}{\sqrt{\frac{1}{n} \sum_i x_i^2 + \epsilon}} \cdot \gamma.
+        y = \frac{x}{\sqrt{\mathrm{E}[x^2] + \epsilon}} \cdot \gamma,
 
-    Unlike :class:`LayerNorm` there is no mean subtraction and no learned shift; the scale is the only
-    parameter. This is the normalization used by the Llama, Gemma and Qwen decoder families.
+    where the mean of squares is taken over the last axis. Unlike :class:`LayerNorm` the mean is
+    left where it is, so the transform is a rescaling rather than a standardization, and there is no
+    learned shift to go with the scale.
 
     Parameters
     ----------
@@ -375,25 +519,39 @@ class RMSNorm(Layer):
     epsilon : float, optional
         Constant :math:`\epsilon` added to the mean square for numerical stability. Default is 1e-6.
     affine : bool, optional
-        Apply the learned scale :math:`\gamma`. Default is True.
+        Apply the learned scale :math:`\gamma`, starting from :math:`\gamma = 1`, which a redraw
+        returns it to. Default is True.
+    scale_initializer : Initializer, optional
+        How :math:`\gamma` is drawn. Ones when omitted, which is the identity; drawing a random
+        factor to rescale a normalized activation by would defeat the layer.
 
-    References
-    ----------
-    .. [1] Zhang, B., & Sennrich, R. (2019). Root Mean Square Layer Normalization.
-           arXiv:1910.07467. https://arxiv.org/abs/1910.07467.
+    Examples
+    --------
+    Normalize the queries of an attention head, which is where a transformer puts it to keep the
+    logits in range:
+
+    .. code-block:: python
+
+        from pytensor_ml.layers import Input, RMSNorm
+
+        queries = Input("queries", shape=(None, 8, 512, 64))
+        normalized = RMSNorm("q_norm", n_in=64)(queries)
     """
 
     def __init__(
         self,
         name: str | None = None,
+        *,
         n_in: int | None = None,
         epsilon: float = 1e-6,
         affine: bool = True,
+        scale_initializer: Initializer | None = None,
     ):
-        self.name = name if name else "RMSNorm"
+        self.name = _resolve_layer_name(name, type(self).__name__, "n_in")
         self.n_in = n_in
         self.epsilon = epsilon
         self.affine = affine
+        self._scale_initializer = scale_initializer
 
         self.scale: TrainableParameter | None = None
 
@@ -409,7 +567,9 @@ class RMSNorm(Layer):
             return
 
         if self.affine:
-            self.scale = trainable(np.ones(n_in, dtype=config.floatX), f"{self.name}_scale")
+            self.scale = _norm_parameter(
+                self.name, "scale", n_in, self._scale_initializer, OneInitializer()
+            )
 
         self.initialized = True
 
@@ -425,6 +585,165 @@ class RMSNorm(Layer):
         X_transformed = RMSNormLayer(
             name=self.name,
             n_in=self.n_in,
+            epsilon=self.epsilon,
+            affine=self.affine,
+        )(*inputs)
+        X_transformed.name = f"{self.name}_output"
+
+        return X_transformed
+
+
+class GroupNormLayer(UnaryLayerOp):
+    __props__ = ("n_in", "n_groups", "epsilon", "affine")
+
+    def build_inner_graph(self, X, *rest):
+        affine_params, _ = _split_affine(self.affine, rest)
+        channels_per_group = X.shape[-1] // self.n_groups
+        grouped = pt.split_dims(X, shape=(self.n_groups, channels_per_group), axis=-1)
+
+        # X's spatial axes, which the split leaves in place, and the group's own channels at the end.
+        statistic_axes = (*range(1, X.ndim - 1), -1)
+        X_grouped, _, _ = _standardize(grouped, self.epsilon, axis=statistic_axes, keepdims=True)
+        X_normalized = pt.join_dims(X_grouped, start_axis=-2, n_axes=2)
+
+        return [_rescale(X_normalized, affine_params)]
+
+
+class GroupNorm(Layer):
+    r"""
+    Group normalization over a channel grouping and every spatial axis.
+
+    Split the channels into ``n_groups`` contiguous groups, standardize each group of each sample
+    independently, then optionally apply a learned per-channel affine transform:
+
+    .. math::
+
+        y = \frac{x - \mathrm{E}[x]}{\sqrt{\mathrm{Var}[x] + \epsilon}} \cdot \gamma + \beta,
+
+    where the mean and (biased) variance are taken over one group's channels together with every
+    spatial axis, giving one statistic per sample per group. Like :class:`LayerNorm` and unlike
+    :class:`BatchNorm`, the statistics depend only on the current sample, so there are no running
+    statistics and no train/eval distinction, which is why convolutional networks trained at small
+    batch sizes reach for it.
+
+    ``n_groups = 1`` puts every channel in one group and normalizes each sample's whole feature map
+    at once; ``n_groups = n_in`` gives each channel its own statistic, which is instance
+    normalization.
+
+    Parameters
+    ----------
+    name : str, optional
+        Name used as a prefix for the layer's parameters. Default is "GroupNorm".
+    n_groups : int
+        Number of groups :math:`G` the channels are split into. Must divide the channel count.
+    n_in : int, optional
+        Size of the channel axis. Inferred from the input's last dimension on the first call when
+        omitted.
+    epsilon : float, optional
+        Constant :math:`\epsilon` added to the variance for numerical stability. Default is 1e-5.
+    affine : bool, optional
+        Apply the learned scale :math:`\gamma` and shift :math:`\beta`, one entry per channel,
+        starting from the identity transform :math:`\gamma = 1`, :math:`\beta = 0`, which a redraw
+        returns them to. Default is True.
+    scale_initializer : Initializer, optional
+        How :math:`\gamma` is drawn. Ones when omitted, which is the identity transform; drawing a
+        random factor to rescale a normalized activation by would defeat the layer.
+    loc_initializer : Initializer, optional
+        How :math:`\beta` is drawn. Zeros when omitted.
+
+    Examples
+    --------
+    Normalize a convolution's output over 8 groups of its 32 channels. The input is channel-last,
+    ``(batch, height, width, channels)``, so each of the 8 statistics covers 4 channels and the whole
+    spatial extent of one image:
+
+    .. code-block:: python
+
+        from pytensor_ml.activations import Swish
+        from pytensor_ml.layers import Conv2D, GroupNorm, Input, Sequential
+
+        X = Input("X", shape=(None, 64, 64, 3))
+        network = Sequential(
+            Conv2D("conv", in_channels=3, out_channels=32, kernel_size=3, padding="same"),
+            GroupNorm("gn", n_groups=8, n_in=32),
+            Swish(),
+        )
+
+        activations = network(X)
+    """
+
+    def __init__(
+        self,
+        name: str | None = None,
+        *,
+        n_groups: int,
+        n_in: int | None = None,
+        epsilon: float = 1e-5,
+        affine: bool = True,
+        scale_initializer: Initializer | None = None,
+        loc_initializer: Initializer | None = None,
+    ):
+        self.name = _resolve_layer_name(name, type(self).__name__, "n_groups")
+        if n_groups < 1:
+            raise ValueError(f"{self.name} needs at least one group, but got n_groups={n_groups}.")
+
+        self.n_groups = n_groups
+        self.n_in = n_in
+        self.epsilon = epsilon
+        self.affine = affine
+        self._scale_initializer = scale_initializer
+        self._loc_initializer = loc_initializer
+
+        self.scale: TrainableParameter | None = None
+        self.loc: TrainableParameter | None = None
+
+        self.initialized = False
+        self._initialize_params(None)
+
+    def _initialize_params(self, X: pt.TensorVariable | None):
+        if self.initialized:
+            return
+
+        n_in = _resolve_n_in(self.name, self.n_in, X)
+        if n_in is None:
+            return
+
+        if n_in % self.n_groups:
+            raise ValueError(
+                f"{self.name} splits the channels into equal groups, so n_groups must divide the "
+                f"channel count; {self.n_groups} groups do not divide {n_in} channels."
+            )
+
+        if self.affine:
+            self.loc, self.scale = _affine_parameters(
+                self.name,
+                n_in,
+                loc_initializer=self._loc_initializer,
+                scale_initializer=self._scale_initializer,
+            )
+
+        self.initialized = True
+
+    def __call__(self, X: pt.TensorLike) -> pt.TensorVariable:
+        X = pt.as_tensor(X)
+        if X.ndim < 2:
+            raise ValueError(
+                f"{self.name} groups the last axis and reduces over the spatial axes before it, so "
+                f"it needs at least a batch axis and a channel axis; got a {X.ndim}-dimensional "
+                f"input."
+            )
+
+        self._initialize_params(X)
+
+        inputs = [X]
+        if self.affine:
+            assert self.scale is not None and self.loc is not None
+            inputs.extend([self.loc, self.scale])
+
+        X_transformed = GroupNormLayer(
+            name=self.name,
+            n_in=self.n_in,
+            n_groups=self.n_groups,
             epsilon=self.epsilon,
             affine=self.affine,
         )(*inputs)

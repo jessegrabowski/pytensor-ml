@@ -21,7 +21,9 @@ def run_training():
 
     def _run(rule, n_steps: int = 50, seed: int = 0) -> list[float]:
         X = pt.tensor("X", shape=(None, 8))
-        network = Sequential(Linear("fc1", 8, 16), ReLU(), Linear("fc2", 16, 4))
+        network = Sequential(
+            Linear("fc1", n_in=8, n_out=16), ReLU(), Linear("fc2", n_in=16, n_out=4)
+        )
         y = network(X)
 
         params = collect_trainable_params(y)

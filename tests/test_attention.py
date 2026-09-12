@@ -34,8 +34,9 @@ def sdpa_np(q, k, v, *, is_causal=False, mask=None, scale=None):
     if n_rep > 1:
         k = np.repeat(k, n_rep, axis=1)
         v = np.repeat(v, n_rep, axis=1)
+    # np.sqrt(int) is a float64 zero-dim array, not a weak scalar, and would upcast the scores.
     scale = 1.0 / np.sqrt(q.shape[-1]) if scale is None else scale
-    scores = (q @ k.swapaxes(-1, -2)) * scale
+    scores = (q @ k.swapaxes(-1, -2)) * np.asarray(scale, dtype=q.dtype)
     if is_causal:
         sq, sk = q.shape[-2], k.shape[-2]
         causal = np.arange(sk)[None, :] <= np.arange(sq)[:, None] + (sk - sq)
@@ -154,7 +155,7 @@ def set_random_weights(layer, rng):
 
 def test_multihead_attention_shape_and_value(rng):
     n_embd, n_head = 12, 3
-    mha = MultiheadAttention("mha", n_embd, n_head)
+    mha = MultiheadAttention("mha", n_embd=n_embd, n_head=n_head)
     set_random_weights(mha, rng)
 
     X = pt.tensor("X", shape=(None, None, n_embd))
@@ -183,8 +184,117 @@ def test_multihead_attention_shape_and_value(rng):
     np.testing.assert_allclose(result, expected, atol=1e-5)
 
 
+def test_cross_attention_shape_and_value(rng):
+    n_embd, kv_dim, n_head = 12, 8, 3
+    mha = MultiheadAttention("mha", n_embd=n_embd, n_head=n_head, kv_dim=kv_dim)
+    set_random_weights(mha, rng)
+
+    assert mha.q_proj.W.get_value().shape[0] == n_embd
+    assert mha.k_proj.W.get_value().shape[0] == kv_dim
+    assert mha.v_proj.W.get_value().shape[0] == kv_dim
+
+    X = pt.tensor("X", shape=(None, None, n_embd))
+    context = pt.tensor("context", shape=(None, None, kv_dim))
+    out = mha(X, context)
+    assert out.type.shape == (None, None, n_embd)
+
+    batch, seq, seq_kv = 2, 5, 3
+    X_np = rng.normal(size=(batch, seq, n_embd)).astype(floatX)
+    context_np = rng.normal(size=(batch, seq_kv, kv_dim)).astype(floatX)
+    result = out.eval({X: X_np, context: context_np})
+
+    head_dim = n_embd // n_head
+
+    def project(proj, x):
+        return x @ proj.W.get_value() + proj.b.get_value()
+
+    def split(x, length):
+        return x.reshape(batch, length, n_head, head_dim).transpose(0, 2, 1, 3)
+
+    q = split(project(mha.q_proj, X_np), seq)
+    k = split(project(mha.k_proj, context_np), seq_kv)
+    v = split(project(mha.v_proj, context_np), seq_kv)
+    attn = sdpa_np(q, k, v).transpose(0, 2, 1, 3).reshape(batch, seq, n_embd)
+    expected = project(mha.out_proj, attn)
+
+    np.testing.assert_allclose(result, expected, atol=1e-5)
+
+
+def test_causal_cross_attention_raises():
+    mha = MultiheadAttention("mha", n_embd=12, n_head=3, is_causal=True)
+    X = pt.tensor("X", shape=(2, 5, 12))
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        mha(X, X)
+
+
+@pytest.mark.parametrize("n_kv_head", [None, 2], ids=["multi_head", "grouped_query"])
+def test_fused_qkv_matches_three_separate_projections(n_kv_head, rng):
+    """The fused weight is the three stacked in q, k, v order, so splitting it has to reproduce them
+    exactly. Grouped-query attention makes the three widths unequal, which is where an even split
+    would go wrong."""
+    n_embd, n_head = 12, 4
+    separate = MultiheadAttention("sep", n_embd=n_embd, n_head=n_head, n_kv_head=n_kv_head)
+    fused = MultiheadAttention(
+        "fused", n_embd=n_embd, n_head=n_head, n_kv_head=n_kv_head, fused_qkv=True
+    )
+    set_random_weights(separate, rng)
+
+    stacked = np.concatenate(
+        [
+            separate.q_proj.W.get_value(),
+            separate.k_proj.W.get_value(),
+            separate.v_proj.W.get_value(),
+        ],
+        axis=-1,
+    )
+    stacked_bias = np.concatenate(
+        [
+            separate.q_proj.b.get_value(),
+            separate.k_proj.b.get_value(),
+            separate.v_proj.b.get_value(),
+        ]
+    )
+    fused.qkv_proj.W.set_value(stacked)
+    fused.qkv_proj.b.set_value(stacked_bias)
+    fused.out_proj.W.set_value(separate.out_proj.W.get_value())
+    fused.out_proj.b.set_value(separate.out_proj.b.get_value())
+
+    X = pt.tensor("X", shape=(2, 5, n_embd))
+    X_np = rng.normal(size=(2, 5, n_embd)).astype(floatX)
+
+    np.testing.assert_allclose(
+        fused(X).eval({X: X_np}), separate(X).eval({X: X_np}), rtol=1e-6, atol=1e-6
+    )
+
+
+def test_fused_qkv_owns_one_weight_of_the_stacked_width():
+    """GPT-2 stores c_attn as a single tensor, so a loader must find one parameter rather than three."""
+    fused = MultiheadAttention("fused", n_embd=12, n_head=3, fused_qkv=True)
+
+    assert fused.qkv_proj.W.get_value().shape == (12, 36)
+    assert (fused.q_proj, fused.k_proj, fused.v_proj) == (None, None, None)
+
+
+def test_fused_qkv_with_a_separate_kv_width_raises_at_construction():
+    """A differently-sized key/value input cannot share a weight with the queries, and there is no
+    point building the layer to find out."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        MultiheadAttention("fused", n_embd=12, n_head=3, fused_qkv=True, kv_dim=8)
+
+
+def test_fused_qkv_with_a_second_input_raises_at_call():
+    """Keys and values come from the query's own weight, so a second input has nowhere to project.
+    The layer is legal to build -- only using it this way is not."""
+    attention = MultiheadAttention("fused", n_embd=12, n_head=3, fused_qkv=True)
+    X = pt.tensor("X", shape=(2, 5, 12))
+
+    with pytest.raises(ValueError, match="cannot come from a second input"):
+        attention(X, X)
+
+
 def test_causal_self_attention_is_causal(rng):
-    csa = CausalSelfAttention("csa", 12, 3)
+    csa = CausalSelfAttention("csa", n_embd=12, n_head=3)
     assert csa.is_causal is True
     out = csa(pt.tensor("X", shape=(2, 5, 12)))
     attn_ops = [
@@ -198,7 +308,7 @@ def test_causal_self_attention_is_causal(rng):
 
 def test_attention_gradient_flows_to_all_projections(rng):
     n_embd, n_head = 8, 2
-    csa = CausalSelfAttention("csa", n_embd, n_head)
+    csa = CausalSelfAttention("csa", n_embd=n_embd, n_head=n_head)
     set_random_weights(csa, rng)
 
     X = pt.tensor("X", shape=(2, 4, n_embd))
@@ -213,7 +323,7 @@ def test_attention_gradient_flows_to_all_projections(rng):
 def test_attention_vectorizes_over_independent_inputs(rng):
     """vectorize_graph adds a leading batch of independent forward passes (multi-prediction)."""
     n_embd, n_head = 8, 2
-    mha = MultiheadAttention("mha", n_embd, n_head, is_causal=True)
+    mha = MultiheadAttention("mha", n_embd=n_embd, n_head=n_head, is_causal=True)
     set_random_weights(mha, rng)
 
     X = pt.tensor("X", shape=(2, 4, n_embd))

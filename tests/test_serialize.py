@@ -10,7 +10,17 @@ from pytensor.graph.type import Type
 from pytensor.tensor.random.op import RandomVariable
 from pytensor.tensor.type import TensorType
 
-from pytensor_ml.activations import GELU, LeakyReLU, ReLU, Sigmoid, Softmax, SoftPlus, Swish, Tanh
+from pytensor_ml.activations import (
+    GELU,
+    LeakyReLU,
+    QuickGELU,
+    ReLU,
+    Sigmoid,
+    Softmax,
+    SoftPlus,
+    Swish,
+    Tanh,
+)
 from pytensor_ml.json_serialize import (
     deserialize_graph,
     op_from_json,
@@ -21,10 +31,12 @@ from pytensor_ml.json_serialize import (
     type_to_json,
 )
 from pytensor_ml.layers import (
-    BatchNorm2D,
+    BatchNorm,
     Concatenate,
     Dropout,
     Embedding,
+    Flatten,
+    GroupNorm,
     LayerNorm,
     Linear,
     RMSNorm,
@@ -49,6 +61,7 @@ ALL_ACTIVATIONS = [
     GELU(approximate=True),
     Swish(),
     Swish(beta=1.5),
+    QuickGELU(),
 ]
 
 
@@ -56,6 +69,12 @@ def assert_outputs_roundtrip(data_inputs, outputs, data_values):
     """Serialize the graph of ``outputs`` to JSON and back, and check the rebuilt graph computes the same."""
     output_list = outputs if isinstance(outputs, list) else [outputs]
     shared = collect_shared_variables(output_list)
+    # Plain literals default to float64, which does not fit a float32 graph.
+    data_values = [
+        np.asarray(value, dtype=data_input.type.dtype)
+        for data_input, value in zip(data_inputs, data_values)
+    ]
+
     # allow_nan=False enforces strict, portable JSON: inf/nan must go through sentinels, not the
     # non-standard Infinity/NaN tokens a lenient parser would emit.
     blob = json.dumps(serialize_graph([*data_inputs, *shared], output_list), allow_nan=False)
@@ -73,27 +92,31 @@ def initialized_network(*layers, seed=0):
     X = pt.matrix("X")
     output = Sequential(*layers)(X)
     for parameter in collect_trainable_params(output):
-        parameter.set_value(rng.normal(size=parameter.get_value().shape))
+        value = rng.normal(size=parameter.get_value().shape)
+        parameter.set_value(value.astype(parameter.type.dtype))
     return X, output
 
 
 def _activation_id(activation):
     if isinstance(activation, GELU) and activation.approximate:
         return "GELU_tanh"
-    if isinstance(activation, Swish):
+    # Exactly Swish, not QuickGELU: the suffix disambiguates instances that differ by beta.
+    if type(activation) is Swish:
         return f"Swish_beta{activation.beta}"
     return type(activation).__name__
 
 
 @pytest.mark.parametrize("activation", ALL_ACTIVATIONS, ids=_activation_id)
 def test_every_activation_roundtrips(activation):
-    X, output = initialized_network(Linear("fc1", 4, 8), activation, Linear("fc2", 8, 4))
+    X, output = initialized_network(
+        Linear("fc1", n_in=4, n_out=8), activation, Linear("fc2", n_in=8, n_out=4)
+    )
     assert_outputs_roundtrip([X], output, [np.random.default_rng(1).normal(size=(5, 4))])
 
 
 @pytest.mark.parametrize("bias", [True, False], ids=["bias", "no_bias"])
 def test_linear_bias_variants_roundtrip(bias):
-    X, output = initialized_network(Linear("fc", 4, 3, bias=bias))
+    X, output = initialized_network(Linear("fc", n_in=4, n_out=3, bias=bias))
     assert_outputs_roundtrip([X], output, [np.random.default_rng(1).normal(size=(5, 4))])
 
 
@@ -103,19 +126,33 @@ def test_linear_bias_variants_roundtrip(bias):
     ids=["default", "no_affine", "no_running_stats"],
 )
 def test_batchnorm_variants_roundtrip(kwargs):
-    X, output = initialized_network(Linear("fc", 4, 4), BatchNorm2D("bn", n_in=4, **kwargs))
+    X, output = initialized_network(
+        Linear("fc", n_in=4, n_out=4), BatchNorm("bn", n_in=4, **kwargs)
+    )
     assert_outputs_roundtrip([X], output, [np.random.default_rng(1).normal(size=(8, 4))])
 
 
 @pytest.mark.parametrize("affine", [True, False], ids=["affine", "no_affine"])
 def test_layernorm_roundtrips(affine):
-    X, output = initialized_network(Linear("fc", 4, 6), LayerNorm("ln", n_in=6, affine=affine))
+    X, output = initialized_network(
+        Linear("fc", n_in=4, n_out=6), LayerNorm("ln", n_in=6, affine=affine)
+    )
     assert_outputs_roundtrip([X], output, [np.random.default_rng(1).normal(size=(8, 4))])
 
 
 @pytest.mark.parametrize("affine", [True, False], ids=["affine", "no_affine"])
 def test_rmsnorm_roundtrips(affine):
-    X, output = initialized_network(Linear("fc", 4, 6), RMSNorm("rms", n_in=6, affine=affine))
+    X, output = initialized_network(
+        Linear("fc", n_in=4, n_out=6), RMSNorm("rms", n_in=6, affine=affine)
+    )
+    assert_outputs_roundtrip([X], output, [np.random.default_rng(1).normal(size=(8, 4))])
+
+
+@pytest.mark.parametrize("affine", [True, False], ids=["affine", "no_affine"])
+def test_groupnorm_roundtrips(affine):
+    X, output = initialized_network(
+        Linear("fc", n_in=4, n_out=6), GroupNorm("gn", n_groups=3, n_in=6, affine=affine)
+    )
     assert_outputs_roundtrip([X], output, [np.random.default_rng(1).normal(size=(8, 4))])
 
 
@@ -126,8 +163,7 @@ def test_rmsnorm_roundtrips(affine):
     ids=["unscaled", "linear", "ntk"],
 )
 def test_rotary_embedding_roundtrips(pairing, scaling, scaling_factor):
-    # Every option is a prop, so the rebuilt op must reproduce the same frequencies; a dropped prop
-    # would silently fall back to the default and still evaluate.
+    """A restored graph preserves non-default rotation frequencies and pairing."""
     x = pt.tensor("x", shape=(2, 3, 5, 8))
     positions = pt.lvector("positions")
     output = rotary_embedding(
@@ -142,6 +178,11 @@ def test_squeeze_roundtrips():
     assert_outputs_roundtrip(
         [X], Squeeze(X[:, :1], axis=1), [np.random.default_rng(0).normal(size=(5, 4))]
     )
+
+
+def test_flatten_roundtrips():
+    X = pt.tensor("X", shape=(None, 3, 4))
+    assert_outputs_roundtrip([X], Flatten(X), [np.random.default_rng(0).normal(size=(5, 3, 4))])
 
 
 def test_concatenate_roundtrips():
@@ -162,7 +203,7 @@ def test_specify_shape_with_unknown_dim_roundtrips():
 def test_embedding_roundtrips():
     ids = pt.lmatrix("ids")
     embedding = Embedding("emb", n_embeddings=8, n_features=5)
-    embedding.W.set_value(np.random.default_rng(0).normal(size=(8, 5)))
+    embedding.W.set_value(np.random.default_rng(0).normal(size=(8, 5)).astype(floatX))
     assert_outputs_roundtrip([ids], embedding(ids), [np.array([[1, 2, 3], [4, 0, 7]])])
 
 
@@ -179,9 +220,10 @@ def test_attention_roundtrips(is_causal, scale):
 
 def test_multi_output_network_roundtrips():
     X = pt.matrix("X")
-    output = [Linear("head_a", 4, 2)(X), Linear("head_b", 4, 3)(X)]
+    output = [Linear("head_a", n_in=4, n_out=2)(X), Linear("head_b", n_in=4, n_out=3)(X)]
     for parameter in collect_trainable_params(output):
-        parameter.set_value(np.random.default_rng(0).normal(size=parameter.get_value().shape))
+        value = np.random.default_rng(0).normal(size=parameter.get_value().shape)
+        parameter.set_value(value.astype(parameter.type.dtype))
     assert_outputs_roundtrip([X], output, [np.random.default_rng(1).normal(size=(5, 4))])
 
 
@@ -201,7 +243,8 @@ def test_dropout_graph_with_rng_roundtrips():
 def test_scan_recurrent_loop_roundtrips():
     rng = np.random.default_rng(0)
     sequence = pt.matrix("sequence")
-    W_rec = pytensor.shared(rng.normal(size=(3, 3)), name="W_rec")
+    # floatX: the recurrence must not upcast against the float32 initial state.
+    W_rec = pytensor.shared(rng.normal(size=(3, 3)).astype(floatX), name="W_rec")
 
     def step(x_t, hidden):
         return pt.tanh(x_t + hidden @ W_rec)

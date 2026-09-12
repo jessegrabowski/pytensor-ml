@@ -3,7 +3,7 @@ import json
 from collections.abc import Sequence
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import pytensor
@@ -11,15 +11,37 @@ import pytensor
 from pytensor.compile.sharedvalue import SharedVariable
 from pytensor.graph.basic import Variable
 from pytensor.tensor.random.type import RandomGeneratorType
+from safetensors import safe_open
 
-from pytensor_ml.checkpoint import load_state, save_state
-from pytensor_ml.json_serialize import deserialize_graph, serialize_graph, type_from_json
+from pytensor_ml.checkpoint import (
+    bit_generator_kind,
+    generator_from_state,
+    holds_generator,
+    jsonable_rng_state,
+    load_state,
+    save_state,
+)
+from pytensor_ml.json_serialize import (
+    deserialize_graph,
+    props_from_json,
+    props_to_json,
+    qualname,
+    resolve_class,
+    serialize_graph,
+    type_from_json,
+)
+from pytensor_ml.models import build_from_config
 from pytensor_ml.params import NonTrainableParameter, TrainableParameter, non_trainable, trainable
 from pytensor_ml.pytensorf import (
     as_output_list,
     collect_data_inputs,
     collect_shared_variables,
-    find_rng_nodes,
+)
+from pytensor_ml.state import (
+    EmptyInitializer,
+    Initializer,
+    UnrecordedInitializer,
+    initial_values_from,
 )
 
 CONFIG_FILENAME = "config.json"
@@ -28,7 +50,7 @@ WEIGHTS_FILENAME = "model.safetensors"
 # Marks a config as a pytensor_ml graph (vs a HuggingFace config, which shares the config.json filename but
 # is a hyperparameter sheet, not a serialized graph). The version guards future schema changes.
 GRAPH_FORMAT = "pytensor_ml.graph"
-GRAPH_FORMAT_VERSION = 3
+GRAPH_FORMAT_VERSION = 4
 
 Format = Literal["auto", "pytensor", "huggingface"]
 
@@ -44,7 +66,47 @@ class InputKind(StrEnum):
 
 
 def _looks_like_huggingface(config: dict) -> bool:
-    return "model_type" in config or "architectures" in config
+    # Diffusers writes _class_name; transformers writes model_type and architectures. A directory with
+    # any of them is somebody else's checkpoint rather than one of ours.
+    return any(key in config for key in ("_class_name", "model_type", "architectures"))
+
+
+def _huggingface_weights(directory: Path, variant: str | None) -> Path:
+    """
+    The safetensors file in a HuggingFace component directory.
+
+    The name varies by toolchain and precision -- transformers writes ``model.safetensors``, diffusers
+    writes ``diffusion_pytorch_model.safetensors``, and a half-precision download inserts a variant
+    before the extension -- so it is resolved rather than assumed.
+    """
+    shards = sorted(directory.glob("*.safetensors.index.json"))
+    if shards:
+        raise NotImplementedError(
+            f"{directory} holds a sharded checkpoint ({shards[0].name}). Sharded checkpoints are not "
+            f"read yet; no single shard is the whole model."
+        )
+
+    candidates = sorted(directory.glob("*.safetensors"))
+    if not candidates:
+        raise FileNotFoundError(
+            f"No .safetensors weights in {directory}. Only safetensors is read; a .bin checkpoint "
+            f"has to be converted first."
+        )
+
+    if variant is not None:
+        # Matched on the stem rather than on suffixes, which would read the "1.0" of a name like
+        # sd-xl-1.0.safetensors as a variant.
+        candidates = [path for path in candidates if path.stem.endswith(f".{variant}")]
+        if not candidates:
+            raise FileNotFoundError(f"No *.{variant}.safetensors in {directory}.")
+
+    if len(candidates) > 1:
+        names = ", ".join(path.name for path in candidates)
+        raise ValueError(
+            f"{directory} holds several weight files ({names}), so which to load is ambiguous. Pass "
+            f"variant= to choose one."
+        )
+    return candidates[0]
 
 
 def _detect_format(config: dict) -> Format:
@@ -57,17 +119,15 @@ def _detect_format(config: dict) -> Format:
 
 def _weight_variables(outputs: Variable | Sequence[Variable]) -> list[SharedVariable]:
     # Random generators are excluded: their state rides in the config as JSON, not as a tensor.
-    output_list = as_output_list(outputs)
-    random_generators = set(find_rng_nodes(output_list))
     return [
         variable
-        for variable in collect_shared_variables(output_list)
-        if variable not in random_generators
+        for variable in collect_shared_variables(as_output_list(outputs))
+        if not holds_generator(variable)
     ]
 
 
 def _input_kind(variable: Variable) -> InputKind:
-    if isinstance(variable.type, RandomGeneratorType):
+    if isinstance(variable.type, RandomGeneratorType) and isinstance(variable, SharedVariable):
         return InputKind.RNG
     if isinstance(variable, TrainableParameter):
         return InputKind.TRAINABLE
@@ -78,12 +138,71 @@ def _input_kind(variable: Variable) -> InputKind:
     return InputKind.DATA
 
 
+def _recordable(initializer: Initializer) -> dict | None:
+    """Return the encoding of ``initializer``, or None when it cannot be written down and read back."""
+    class_path = qualname(initializer)
+    try:
+        props = props_to_json(initializer)
+    except TypeError:
+        return None  # a parameter that is not JSON, such as an array or a fitted model
+    try:
+        restored_class = resolve_class(class_path)
+    except (ImportError, AttributeError):
+        return None  # defined where an import cannot reach it, such as inside a function
+
+    if restored_class is not type(initializer):
+        return None  # the name at that path now means something else
+    return {"class": class_path, "props": props}
+
+
+def _initializer_to_json(initializer: Initializer) -> dict:
+    """
+    Encode the law a parameter is drawn from, as a class path and its ``__props__``.
+
+    An initializer that cannot be written down is recorded as an :class:`UnrecordedInitializer` naming it.
+    Saving still succeeds, because restoring values is the usual reason to save and that needs no law at
+    all; only a redraw needs one, and that is where the loss is reported.
+    """
+    encoded = _recordable(initializer)
+    if encoded is not None:
+        return encoded
+
+    lost = UnrecordedInitializer(type(initializer).__name__)
+    return {"class": qualname(lost), "props": props_to_json(lost)}
+
+
+def _initializer_from_json(initializer_dict: dict) -> Initializer:
+    return resolve_class(initializer_dict["class"])(**props_from_json(initializer_dict["props"]))
+
+
 def _input_meta(variable: Variable) -> dict:
-    meta = {"name": variable.name, "kind": _input_kind(variable)}
+    meta: dict[str, Any] = {"name": variable.name, "kind": _input_kind(variable)}
     if isinstance(variable, SharedVariable) and meta["kind"] == InputKind.RNG:
         # Captured for exact reproducibility even though load does not restore it by default.
-        meta["rng_state"] = variable.get_value(borrow=True).bit_generator.state
+        state = variable.get_value(borrow=True).bit_generator.state
+        meta["rng_state"] = jsonable_rng_state(state)
+    if isinstance(variable, TrainableParameter) and variable.initializer is not None:
+        meta["initializer"] = _initializer_to_json(variable.initializer)
     return meta
+
+
+def _rebuild_trainable(graph_type, meta: dict) -> TrainableParameter:
+    """
+    Rebuild one trainable parameter, holding a draw from the initializer the config recorded for it.
+
+    Drawn rather than zero-filled, so a rebuilt parameter holds a value for the same reason a freshly
+    constructed one does. An initializer the config could not record has nothing to draw from, and says so
+    on the redraw that needs it rather than here, where restoring saved values is the point.
+    """
+    initializer_dict = meta.get("initializer")
+    initializer = None if initializer_dict is None else _initializer_from_json(initializer_dict)
+
+    if initializer is None or isinstance(initializer, UnrecordedInitializer):
+        value = np.zeros(graph_type.shape, dtype=graph_type.dtype)
+    else:
+        value = initializer.initial_value(graph_type.shape)
+
+    return trainable(value, meta["name"], initializer=initializer)
 
 
 def _rebuild_input(type_json: dict, meta: dict, restore_rng: bool):
@@ -91,15 +210,20 @@ def _rebuild_input(type_json: dict, meta: dict, restore_rng: bool):
     if kind == InputKind.DATA:
         return type_from_json(type_json)(name=name)
     if kind == InputKind.RNG:
-        generator = np.random.default_rng()
         if restore_rng:
-            generator.bit_generator.state = meta["rng_state"]
+            generator = generator_from_state(meta["rng_state"])
+        else:
+            # A fresh stream, but of the kind the network was saved with: the default kind silently
+            # rebuilds a different architecture, and any later load_state then fails on the kind.
+            # Only the recorded kind is read, so state this call discards cannot make it fail.
+            generator = np.random.Generator(bit_generator_kind(meta["rng_state"])())
         return pytensor.shared(generator, name=name)
 
     graph_type = type_from_json(type_json)
-    placeholder = np.zeros(graph_type.shape, dtype=graph_type.dtype)
     if kind == InputKind.TRAINABLE:
-        return trainable(placeholder, name)
+        return _rebuild_trainable(graph_type, meta)
+
+    placeholder = np.zeros(graph_type.shape, dtype=graph_type.dtype)
     if kind == InputKind.NON_TRAINABLE:
         return non_trainable(placeholder, name)
     return pytensor.shared(placeholder, name=name)
@@ -118,6 +242,10 @@ def save_network(
     :func:`load_network` can rebuild the graph with the right variable identities. The data inputs are
     collected from ``outputs`` unless given explicitly.
 
+    A random generator is the one input whose *value* is recorded here, since it has no tensor to ride in
+    a weights archive. That makes the config depend on how far the generators have been drawn, so two
+    saves of one architecture differ; :func:`load_network` reads it back only when asked.
+
     Parameters
     ----------
     outputs : Variable or sequence of Variable
@@ -127,6 +255,22 @@ def save_network(
     inputs : sequence of Variable, optional
         The network's data inputs, in call order. Collected from ``outputs`` when omitted; pass explicitly
         when call order matters.
+
+    Examples
+    --------
+    Write the architecture alone, as JSON. The weights are not in it, so pair it with
+    :func:`~pytensor_ml.checkpoint.save_state` or use :func:`save_pretrained`, which writes both.
+    The destination directory has to exist already:
+
+    .. code-block:: python
+
+        from pytensor_ml import save_network
+        from pytensor_ml.layers import Input, Linear
+
+        X = Input("X", shape=(None, 64))
+        logits = Linear("logits", n_in=64, n_out=10)(X)
+
+        save_network(logits, "config.json")
     """
     output_list = as_output_list(outputs)
     data_inputs = list(inputs) if inputs is not None else collect_data_inputs(output_list)
@@ -145,9 +289,14 @@ def load_network(
     """
     Rebuild a network's graph from a :func:`save_network` config file.
 
-    Shared variables (parameters) come back zero-initialized and keep their original names and kinds, so a
-    subsequent :func:`load_state` (or :func:`from_pretrained`) can fill them by name. This restores the
-    architecture only.
+    Shared variables keep their original names and kinds, so a subsequent :func:`load_state` (or
+    :func:`from_pretrained`) can fill them by name. This restores the architecture only -- the values are
+    not the saved ones.
+
+    A trainable parameter comes back holding a draw from the initializer it was built with, as it would if
+    the layer had constructed it, so a loaded architecture is trainable without further calls and a batch
+    norm layer returns to its identity transform. Other shared state is zero-filled, having no law to
+    redraw from.
 
     Parameters
     ----------
@@ -163,6 +312,21 @@ def load_network(
         The network's data inputs, in call order.
     outputs : Variable or list of Variable
         The rebuilt output(s) -- a single variable when the network has one output, otherwise a list.
+
+    Examples
+    --------
+    Rebuild a saved architecture with freshly drawn weights, which is what you want when the values are
+    about to be trained or loaded separately:
+
+    .. code-block:: python
+
+        from pytensor_ml import load_network, save_network
+        from pytensor_ml.layers import Input, Linear
+
+        X = Input("X", shape=(None, 64))
+        save_network(Linear("logits", n_in=64, n_out=10)(X), "config.json")
+
+        inputs, outputs = load_network("config.json")
     """
     config = json.loads(Path(path).read_text())
     if config.get("format") != GRAPH_FORMAT:
@@ -210,6 +374,29 @@ def save_pretrained(
         Destination directory, created if needed.
     inputs : sequence of Variable, optional
         The network's data inputs, in call order. Collected from ``outputs`` when omitted.
+
+    Examples
+    --------
+    Write the architecture and the weights together, so the directory reloads into a runnable network
+    without the Python that defined it:
+
+    .. code-block:: python
+
+        from pytensor_ml import save_pretrained
+        from pytensor_ml.activations import ReLU
+        from pytensor_ml.layers import Input, Linear, Sequential
+        from pytensor_ml.model import Model
+
+        X = Input("X", shape=(None, 64))
+        network = Sequential(
+            Linear("fc", n_in=64, n_out=32),
+            ReLU(),
+            Linear("logits", n_in=32, n_out=10),
+        )
+        logits = network(X)
+        Model(logits).initialize(seed=0)
+
+        save_pretrained(logits, "artifacts/model")
     """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -218,7 +405,11 @@ def save_pretrained(
 
 
 def from_pretrained(
-    directory: str | Path, source_format: Format = "auto", *, restore_rng: bool = False
+    directory: str | Path,
+    source_format: Format = "auto",
+    *,
+    restore_rng: bool = False,
+    variant: str | None = None,
 ) -> tuple[list[Variable], Variable | list[Variable]]:
     """
     Load a complete network -- architecture and weights -- from a directory.
@@ -227,6 +418,11 @@ def from_pretrained(
     ``model.safetensors``. The format is detected from the config by default, since a pytensor_ml graph and
     a HuggingFace model share the same filenames but not the same schema.
 
+    For a HuggingFace directory, dispatches the config to a registered builder and fills the graph it
+    returns from the component's safetensors file. Each weight casts to its parameter's dtype, which
+    ``floatX`` fixed when the layer built it. A checkpoint tensor no parameter loads from is logged
+    rather than treated as an error, since every parameter still got a value.
+
     Parameters
     ----------
     directory : str or pathlib.Path
@@ -234,7 +430,11 @@ def from_pretrained(
     source_format : {'auto', 'pytensor', 'huggingface'}
         Which loader to use. ``'auto'`` detects the format from the config's marker. Default 'auto'.
     restore_rng : bool
-        If True, restore each random generator to its saved state for exact reproducibility. Default False.
+        If True, restore each random generator to its saved state for exact reproducibility. Only a
+        pytensor_ml directory carries generator state. Default False.
+    variant : str, optional
+        Picks between weight files when a directory holds several, as in ``model.fp16.safetensors``.
+        Unnecessary when there is only one.
 
     Returns
     -------
@@ -242,15 +442,49 @@ def from_pretrained(
         The network's data inputs, in call order.
     outputs : Variable or list of Variable
         The rebuilt, weight-filled output(s).
+
+    Examples
+    --------
+    Rebuild a saved network and fill its weights, returning the data inputs and the outputs. Nothing that
+    defined the network has to be importable:
+
+    .. code-block:: python
+
+        import numpy as np
+
+        from pytensor_ml import from_pretrained, save_pretrained
+        from pytensor_ml.layers import Input, Linear
+        from pytensor_ml.model import Model
+        from pytensor_ml.pytensorf import function
+
+        X = Input("X", shape=(None, 64))
+        logits = Linear("logits", n_in=64, n_out=10)(X)
+        Model(logits).initialize(seed=0)
+        save_pretrained(logits, "artifacts/model")
+
+        inputs, outputs = from_pretrained("artifacts/model")
+        predictions = function(inputs, outputs)(np.zeros((4, 64)))
     """
     directory = Path(directory)
     if source_format == "auto":
         source_format = _detect_format(json.loads((directory / CONFIG_FILENAME).read_text()))
     if source_format == "huggingface":
-        raise NotImplementedError(
-            "Loading HuggingFace models is not yet supported; pass a pytensor_ml directory."
-        )
+        if restore_rng:
+            raise ValueError(
+                "restore_rng restores a pytensor_ml graph's saved generator state, and a HuggingFace "
+                "checkpoint carries none."
+            )
+        config = json.loads((directory / CONFIG_FILENAME).read_text())
+        # Every parameter the builder makes is bound to a checkpoint key, and load fills all of them or
+        # raises, so drawing them first is work thrown away.
+        with initial_values_from(EmptyInitializer()):
+            data_inputs, outputs, keys = build_from_config(config)
+        with safe_open(_huggingface_weights(directory, variant), framework="numpy") as weights:
+            keys.load(weights.get_tensor, weights.keys())
+        return data_inputs, outputs
 
-    data_inputs, outputs = load_network(directory / CONFIG_FILENAME, restore_rng=restore_rng)
+    # load_state fills every weight or raises, so the draws load_network would make are thrown away too.
+    with initial_values_from(EmptyInitializer()):
+        data_inputs, outputs = load_network(directory / CONFIG_FILENAME, restore_rng=restore_rng)
     load_state(_weight_variables(outputs), directory / WEIGHTS_FILENAME)
     return data_inputs, outputs

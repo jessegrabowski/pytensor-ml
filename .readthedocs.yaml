@@ -1,0 +1,24 @@
+version: 2
+
+sphinx:
+  configuration: docs/source/conf.py
+  fail_on_warning: false
+
+conda:
+  environment: conda_envs/environment-docs.yml
+
+python:
+  install:
+    - method: pip
+      path: .
+
+build:
+  os: "ubuntu-22.04"
+  tools:
+    python: "miniforge3-latest"
+  jobs:
+    # hatch-vcs derives the version from git tags; RTD's default checkout is shallow and tagless, so
+    # fetch tags or pytensor_ml.__version__ falls back to 0.0.0+unknown and the version selector
+    # labels break.
+    post_checkout:
+      - git fetch --tags --unshallow || true

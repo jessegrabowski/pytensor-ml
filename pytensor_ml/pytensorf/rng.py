@@ -1,6 +1,6 @@
 import warnings
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -30,7 +30,24 @@ def atleast_list(x):
 # Scan, and OpFromGraph between inputs and outputs, so a compiled function advances its generators instead
 # of repeating draws.
 def find_rng_nodes(variables: Iterable[Variable]) -> list[RandomGeneratorSharedVariable]:
-    """Return the shared RNG variables in a graph."""
+    """
+    Return the shared RNG variables in a graph.
+
+    Examples
+    --------
+    Locate the random generators a graph draws from, which is what a dropout layer or any other sampling op
+    leaves behind:
+
+    .. code-block:: python
+
+        from pytensor_ml.layers import Dropout, Input
+        from pytensor_ml.pytensorf import find_rng_nodes
+
+        X = Input("X", shape=(None, 64))
+        activations = Dropout(p=0.5, random_state=0)(X)
+
+        generators = find_rng_nodes([activations])
+    """
     return [
         node for node in graph_inputs(variables) if isinstance(node, RandomGeneratorSharedVariable)
     ]
@@ -44,6 +61,65 @@ def reseed_rngs(rngs: Sequence[SharedVariable], seed: SeedSequenceSeed) -> None:
     ]
     for rng, bit_generator in zip(rngs, bit_generators):
         rng.set_value(np.random.Generator(bit_generator), borrow=True)
+
+
+def find_generators_drawn_from(
+    outputs: Sequence[Variable],
+) -> list[RandomGeneratorSharedVariable]:
+    """
+    Return the shared generators a draw op in this graph consumes.
+
+    Being read is not being consumed: a generator handed back as an output needs no update. One passed
+    into an op carrying an inner graph may draw from it or merely accept it, and only that inner graph
+    knows which, so it is followed. A draw inside one counts.
+
+    Parameters
+    ----------
+    outputs : sequence of Variable
+        Graph outputs to trace back from.
+
+    Returns
+    -------
+    generators : list of RandomGeneratorSharedVariable
+        The generators a draw op consumes, in graph-input order.
+    """
+    fgraph = FunctionGraph(outputs=list(outputs), clone=False)
+    return [
+        generator
+        for generator in fgraph.inputs
+        if isinstance(generator, RandomGeneratorSharedVariable)
+        and _is_drawn_from(fgraph.clients, generator)
+    ]
+
+
+def _inner_counterparts(node: Apply, input_index: int) -> list[Variable]:
+    """Return the inner-graph inputs that a node's outer input at ``input_index`` is passed to."""
+    op = node.op
+    if isinstance(op, Scan):
+        mapping = op.get_oinp_iinp_iout_oout_mappings()["inner_inp_from_outer_inp"]
+        return [op.inner_inputs[index] for index in mapping.get(input_index, [])]
+    if isinstance(op, OpFromGraph):
+        return [op.inner_inputs[input_index]]
+    return []
+
+
+def _is_drawn_from(clients: Mapping[Variable, list[tuple[Apply, int]]], variable: Variable) -> bool:
+    """
+    Report whether a draw op consumes ``variable``, following it into the inner graphs it enters.
+
+    An op carrying an inner graph is not itself a :class:`RNGConsumerOp`, so a generator drawn from only
+    inside one is invisible to a check that reads the outer clients alone.
+    """
+    for client, input_index in clients.get(variable, ()):
+        if isinstance(client.op, RNGConsumerOp):
+            return True
+        inner_inputs = _inner_counterparts(client, input_index)
+        if not inner_inputs:
+            continue
+        inner_clients = client.op.fgraph.clients
+        if any(_is_drawn_from(inner_clients, inner_input) for inner_input in inner_inputs):
+            return True
+    return False
 
 
 def collect_default_updates_inner_fgraph(node: Apply) -> dict[Variable, Variable]:
@@ -81,7 +157,7 @@ def collect_default_updates(
 
     Returns
     -------
-    dict mapping Variable to Variable
+    updates : dict mapping Variable to Variable
         Each RNG variable to the expression for its next state.
     """
 
@@ -135,7 +211,9 @@ def collect_default_updates(
                     next_rng = client.outputs[output_index]
                 else:
                     raise ValueError(
-                        f"No update found for at least one RNG used in Scan Op {client_op}."
+                        f"No update found for at least one RNG used in Scan Op {client_op}. Call "
+                        "`collect_default_updates` inside the scan function and return what it gives you "
+                        "as that step's updates."
                     )
             case OpFromGraph():
                 try:
@@ -144,7 +222,9 @@ def collect_default_updates(
                         return None
                 except ValueError as exc:
                     raise ValueError(
-                        f"No update found for at least one RNG used in OpFromGraph Op {client_op}."
+                        f"No update found for at least one RNG used in OpFromGraph Op {client_op}. Add "
+                        "the advanced generator to the op's outputs, which "
+                        "`pt.random.normal(rng=rng, return_next_rng=True)` gives you alongside the draw."
                     ) from exc
             case _:
                 # Unknown consumer; the caller must provide an update manually.

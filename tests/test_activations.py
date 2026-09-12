@@ -7,7 +7,16 @@ from pytensor import config
 from pytensor.compile import Mode
 from scipy.special import erf
 
-from pytensor_ml.activations import GELU, LeakyReLU, ReLU, Sigmoid, SoftPlus, Swish, Tanh
+from pytensor_ml.activations import (
+    GELU,
+    LeakyReLU,
+    QuickGELU,
+    ReLU,
+    Sigmoid,
+    SoftPlus,
+    Swish,
+    Tanh,
+)
 from pytensor_ml.layers import Linear, Sequential
 from pytensor_ml.loss import CrossEntropy, supervised_loss
 from pytensor_ml.optim import adam, compile_train
@@ -36,6 +45,7 @@ HIDDEN_ACTIVATIONS = [
     GELU(approximate=False),
     GELU(approximate=True),
     Swish(),
+    QuickGELU(),
 ]
 
 
@@ -81,17 +91,32 @@ def test_swish_matches_reference(beta):
     np.testing.assert_allclose(f(values), values / (1 + np.exp(-beta * values)), rtol=1e-6)
 
 
+def test_quick_gelu_fixes_the_clip_beta():
+    """The constant is the whole of QuickGELU; Swish's own tests cover the expression it goes into.
+    A wrong one gives CLIP weights slightly wrong activations and no error."""
+    assert QuickGELU().beta == 1.702
+
+
+@pytest.mark.parametrize("activation", HIDDEN_ACTIVATIONS, ids=_activation_id)
+def test_activation_names_its_output_for_its_class(activation):
+    """The name is what a printed graph shows, so a subclass that inherits its parent's `__call__`
+    still has to say which activation is in the graph."""
+    assert activation(pt.vector("x")).name == type(activation).__name__
+
+
 @pytest.mark.parametrize("activation", HIDDEN_ACTIVATIONS, ids=_activation_id)
 def test_activation_lets_a_network_learn_xor(activation):
     X = pt.matrix("X")
-    output = Sequential(Linear("fc1", 2, 8), activation, Linear("fc2", 8, 2))(X)
+    output = Sequential(Linear("fc1", n_in=2, n_out=8), activation, Linear("fc2", n_in=8, n_out=2))(
+        X
+    )
     parameters = collect_trainable_params(output)
     for parameter, value in zip(
         parameters, initialize_params(parameters, rng=np.random.default_rng(0))
     ):
         parameter.set_value(value)
     loss, target = supervised_loss(
-        output, CrossEntropy(expect_onehot_labels=True, expect_logits=True), ndim_out=2
+        output, CrossEntropy(expect_onehot_labels=True, expect_logits=True)
     )
     step = compile_train(
         loss,
@@ -114,7 +139,8 @@ def _parametrized_activation_id(activation):
     base = _activation_id(activation)
     if isinstance(activation, LeakyReLU):
         return f"{base}_{activation.negative_slope}"
-    if isinstance(activation, Swish):
+    # Exactly Swish, not QuickGELU: the suffix disambiguates instances that differ by beta.
+    if type(activation) is Swish:
         return f"{base}_{activation.beta}"
     return base
 

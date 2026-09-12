@@ -14,27 +14,116 @@ concurrency:
 
 jobs:
   unittest:
+    name: unittest (${{ matrix.os }}, ${{ matrix.python-version }}, ${{ matrix.test-subset.name }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest]
         python-version: ["3.12"]
+        pytensor-mode: [FAST_RUN]
+        # Off by default, flipped to 1 by the per-backend jobs under `include`. A core job installs no
+        # backend at all, which is what proves the library runs without one.
+        install-jax: [0]
+        install-mlx: [0]
+        install-torch: [0]
+        # Groups are balanced on measured cold-compile-cache time, which is what a fresh runner pays.
+        # tests/test_workflow_groups.py fails if a test file is missing from every group or listed twice.
         test-subset:
-          - |
-            tests/
+          - name: attention
+            paths: |
+              tests/test_attention.py
+          - name: layers
+            paths: |
+              tests/test_transformer.py
+              tests/test_layers.py
+              tests/test_positional.py
+              tests/test_recurrent.py
+              tests/test_conv.py
+              tests/test_conv_transpose.py
+              tests/test_padding.py
+              tests/test_pool.py
+              tests/test_upsample.py
+              tests/rewriting/
+          - name: optim
+            paths: |
+              tests/optim/
+          - name: models
+            paths: |
+              tests/test_pretrained.py
+              tests/models/
+          - name: rest
+            paths: |
+              tests/test_serialize.py
+              tests/test_activations.py
+              tests/test_loss.py
+              tests/test_checkpoint.py
+              tests/test_model.py
+              tests/test_pytensorf.py
+              tests/test_state.py
+              tests/test_base.py
+              tests/test_collect.py
+              tests/test_util.py
+              tests/test_workflow_groups.py
+        # Windows runners are roughly twice as slow, and almost everything here is platform independent.
+        # It runs one job over the parts that are not: file IO, paths, and compiling a graph to train.
+        # Backend jobs each install only their backend. Dispatch jobs keep the default mode; positional
+        # jobs run the same general tests in the backend's mode. These live here because mlx needs macOS.
+        include:
+          - os: ubuntu-latest
+            python-version: "3.12"
+            install-jax: 1
+            test-subset:
+              name: dispatch-jax
+              paths: tests/dispatch/jax/
+          - os: macos-15
+            python-version: "3.12"
+            install-mlx: 1
+            test-subset:
+              name: dispatch-mlx
+              paths: tests/dispatch/mlx/
+          - os: ubuntu-latest
+            python-version: "3.12"
+            install-jax: 1
+            pytensor-mode: JAX
+            test-subset:
+              name: positional-jax
+              paths: tests/test_positional.py
+          - os: macos-15
+            python-version: "3.12"
+            install-mlx: 1
+            pytensor-mode: MLX
+            floatX: float32
+            test-subset:
+              name: positional-mlx
+              paths: tests/test_positional.py
+          - os: ubuntu-latest
+            python-version: "3.12"
+            install-torch: 1
+            test-subset:
+              name: dispatch-torch
+              paths: tests/dispatch/pytorch/
+          - os: windows-latest
+            python-version: "3.12"
+            test-subset:
+              name: smoke
+              paths: |
+                tests/test_checkpoint.py
+                tests/test_serialize.py
+                tests/optim/test_training.py
 
     runs-on: ${{ matrix.os }}
 
     env:
-      TEST_SUBSET: ${{ matrix.test-subset }}
+      TEST_SUBSET: ${{ matrix.test-subset.paths }}
+      PYTENSOR_FLAGS: mode=${{ matrix.pytensor-mode || 'FAST_RUN' }},floatX=${{ matrix.floatX || 'float64' }}
 
     defaults:
       run:
         shell: bash -l {0}
 
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-    - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       env:
         CACHE_NUMBER: 0
       with:
@@ -42,7 +131,7 @@ jobs:
         key: ${{ runner.os }}-py${{matrix.python-version}}-conda-${{ env.CACHE_NUMBER }}-${{
           hashFiles('conda_envs/pytensor_ml.yml') }}
     - name: Cache multiple paths
-      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       env:
         # Increase this value to reset cache if pyproject.toml has not changed
         CACHE_NUMBER: 0
@@ -53,6 +142,16 @@ jobs:
           ~\AppData\Local\pip\Cache
         key: ${{ runner.os }}-build-${{ matrix.python-version }}-${{ env.CACHE_NUMBER }}-${{
           hashFiles('pyproject.toml') }}
+    - name: Cache the pytensor compile directory
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      env:
+        CACHE_NUMBER: 0
+      with:
+        path: ~/.pytensor
+        key: ${{ runner.os }}-py${{ matrix.python-version }}-pytensor-${{ env.CACHE_NUMBER }}-${{
+          matrix.test-subset.name }}-${{ hashFiles('conda_envs/pytensor_ml.yml') }}
+        restore-keys: |
+          ${{ runner.os }}-py${{ matrix.python-version }}-pytensor-${{ env.CACHE_NUMBER }}-${{ matrix.test-subset.name }}-
     - uses: conda-incubator/setup-miniconda@8ee1f361103df19b6f8c8655fd3967a8ecb162d5 # v4.0.1
       with:
         miniforge-variant: Miniforge3
@@ -67,6 +166,17 @@ jobs:
         # IMPORTANT: This may break caching of conda packages! See https://github.com/conda-incubator/setup-miniconda/issues/267
         use-only-tar-bz2: false
 
+    - name: Install the backend this job tests
+      run: |
+        conda activate pytensor_ml
+        if [[ $INSTALL_JAX == "1" ]]; then pip install "jax>=0.8,<0.9.1" jaxlib; fi
+        if [[ $INSTALL_MLX == "1" ]]; then pip install "mlx>=0.30,<0.32"; fi
+        if [[ $INSTALL_TORCH == "1" ]]; then pip install torch --index-url https://download.pytorch.org/whl/cpu; fi
+      env:
+        INSTALL_JAX: ${{ matrix.install-jax }}
+        INSTALL_MLX: ${{ matrix.install-mlx }}
+        INSTALL_TORCH: ${{ matrix.install-torch }}
+
     - name: Install current branch
       run: |
         conda activate pytensor_ml
@@ -75,9 +185,9 @@ jobs:
 
     - name: Run tests
       run: |
-        python -m pytest -vv --cov=pytensor_ml --cov-report=xml --no-cov-on-fail --cov-report term $TEST_SUBSET
+        python -m pytest -vv --durations=25 --cov=pytensor_ml --cov-report=xml --no-cov-on-fail --cov-report term $TEST_SUBSET
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v6.0.1
+      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
       with:
         token: ${{ secrets.CODECOV_TOKEN }} # use token for more robust uploads
         env_vars: TEST_SUBSET

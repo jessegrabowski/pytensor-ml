@@ -4,26 +4,111 @@ from typing import Protocol, runtime_checkable
 import pytensor.tensor as pt
 
 from pytensor.compile.builders import SymbolicOp
+from pytensor.graph.basic import Variable
 from pytensor.tensor.variable import TensorVariable
 
 
+def _check_input_rank(X: TensorVariable, name: str, n_spatial: int) -> None:
+    """Reject an input whose rank is not batch, one axis per spatial dimension, then channels."""
+    if X.ndim != n_spatial + 2:
+        raise ValueError(
+            f"{name} takes an input of shape (batch, {', '.join(['spatial'] * n_spatial)}, channels), "
+            f"so it needs a {n_spatial + 2}-dimensional input; got a {X.ndim}-dimensional one."
+        )
+
+
+def _resolve_layer_name(
+    name: object, default: str, suggested_hyperparameter: str | None = None
+) -> str:
+    """
+    Return the layer's name, rejecting a hyperparameter passed where the name belongs.
+
+    Parameters
+    ----------
+    name : str or None
+        The name the caller passed, annotated as ``object`` because validating it is the point.
+        None selects ``default``.
+    default : str
+        The layer's own name, used when none is given and quoted in the error.
+    suggested_hyperparameter : str, optional
+        The parameter the error tells the caller to pass by keyword instead. Layers with no
+        hyperparameter a name could displace omit it, and the error only reports the bad name.
+
+    Returns
+    -------
+    resolved : str
+        ``name`` when it is a non-empty string, otherwise ``default``.
+    """
+    if name is not None and not isinstance(name, str):
+        message = f"{default}'s `name` must be a string, but got {type(name).__name__} {name!r}."
+        if suggested_hyperparameter is not None:
+            message += (
+                f" Hyperparameters are keyword-only, so pass it by name: "
+                f"{default}({suggested_hyperparameter}={name!r})."
+            )
+        raise TypeError(message)
+    return name if name else default
+
+
 class Layer(ABC):
-    """Base class for the objects that build layer graphs. Defined here, not in ``pytensor_ml.layers``, so
-    that ``pytensor_ml.activations`` can subclass it without a circular import."""
+    """
+    Base class for the objects that build layer graphs. Defined here, not in ``pytensor_ml.layers``, so
+    that ``pytensor_ml.activations`` can subclass it without a circular import.
+
+    Examples
+    --------
+    Subclass it when a layer owns parameters or needs a marker op of its own; for anything stateless a
+    plain function is enough. The constructor builds the parameters once, and ``__call__`` builds the graph:
+
+    .. code-block:: python
+
+        import numpy as np
+
+        from pytensor_ml.base import Layer
+        from pytensor_ml.layers import Input
+        from pytensor_ml.params import trainable
+        from pytensor_ml.state import ZeroInitializer
+
+
+        class Bias(Layer):
+            def __init__(self, name, n_in):
+                self.b = trainable(np.zeros(n_in), f"{name}_b", initializer=ZeroInitializer())
+
+            def __call__(self, X):
+                return X + self.b
+
+
+        activations = Bias("bias", n_in=4)(Input("X", shape=(None, 4)))
+    """
 
     @abstractmethod
     def __call__(self, x: pt.TensorLike) -> pt.TensorVariable: ...
 
 
-class PositionalLayer(ABC):
-    """Base class for layers that consume token positions alongside their input.
+class VariadicLayer(ABC):
+    """
+    Base class for graph-building layers that consume multiple tensors.
 
-    A sibling of :class:`Layer` rather than a subclass: narrowing ``Layer.__call__`` from one tensor to
-    two is not a valid override, so a subclass would need a type-checker escape at every level.
+    Examples
+    --------
+    Declare a layer whose inputs are supplied together:
+
+    .. code-block:: python
+
+        import pytensor.tensor as pt
+
+        from pytensor_ml.base import VariadicLayer
+
+        class Add(VariadicLayer):
+            def __call__(self, *inputs: pt.TensorLike) -> pt.TensorVariable:
+                left, right = inputs
+                return pt.as_tensor(left) + pt.as_tensor(right)
+
+        total = Add()(pt.vector("left"), pt.vector("right"))
     """
 
     @abstractmethod
-    def __call__(self, x: pt.TensorLike, position_ids: pt.TensorLike) -> pt.TensorVariable: ...
+    def __call__(self, *inputs: pt.TensorLike) -> pt.TensorVariable: ...
 
 
 class LayerOp(SymbolicOp):
@@ -64,4 +149,38 @@ class StatefulOp(Protocol):
         """Map each output index to the index of the input that output updates."""
 
 
-__all__ = ["Layer", "LayerOp", "PositionalLayer", "StatefulOp", "UnaryLayerOp"]
+def update_chain_root(variable: Variable) -> tuple[Variable, int] | None:
+    """
+    Trace a stateful op's update input back to the value it ultimately writes, and count the applications
+    behind it.
+
+    Applying one layer object again feeds it what the previous application produced, so the input is the
+    written value itself only at the head of that chain. The depth orders the chain, and the deepest
+    application is the one holding every earlier contribution.
+
+    Parameters
+    ----------
+    variable : Variable
+        The input a stateful op declares itself to update.
+
+    Returns
+    -------
+    root : Variable or None
+        The value written at the head of the chain, or None if the chain breaks at an op that declares no
+        update for the output it reaches.
+    depth : int
+        How many applications separate ``variable`` from ``root``.
+    """
+    depth = 0
+    while True:
+        node = variable.owner
+        if node is None or not isinstance(node.op, StatefulOp):
+            return variable, depth
+        input_index = node.op.update_map().get(node.outputs.index(variable))
+        if input_index is None:
+            return None
+        variable = node.inputs[input_index]
+        depth += 1
+
+
+__all__ = ["Layer", "LayerOp", "StatefulOp", "UnaryLayerOp", "VariadicLayer", "update_chain_root"]

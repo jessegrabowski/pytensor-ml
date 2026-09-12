@@ -1,11 +1,12 @@
 import pytensor.tensor as pt
 
 from pytensor_ml.activations import GELU, Activation
-from pytensor_ml.base import Layer
+from pytensor_ml.base import Layer, _resolve_layer_name
 from pytensor_ml.layers.attention import MultiheadAttention
 from pytensor_ml.layers.dropout import Dropout
 from pytensor_ml.layers.linear import Linear
 from pytensor_ml.layers.norm import LayerNorm
+from pytensor_ml.state import Initializer
 
 
 def _identity(x: pt.TensorVariable) -> pt.TensorVariable:
@@ -26,6 +27,17 @@ class FeedForward(Layer):
     where :math:`\phi` is the activation. This is the per-token MLP used in transformer blocks, but it is
     a standalone layer usable anywhere a widening-then-narrowing MLP is wanted.
 
+    Gated, the first projection is twice as wide and its halves multiply rather than one passing
+    through the activation:
+
+    .. math::
+
+        \mathrm{FFN}(x) = \left(a \odot \phi(g)\right) W_2 + b_2, \qquad
+        \left[a, g\right] = x W_1 + b_1.
+
+    That is GEGLU with :class:`~pytensor_ml.activations.GELU` and SwiGLU with
+    :class:`~pytensor_ml.activations.Swish`.
+
     Parameters
     ----------
     name : str or None
@@ -39,30 +51,70 @@ class FeedForward(Layer):
         Hidden-to-model dimension ratio used when ``hidden_dim`` is not given. Default is 4.
     activation : Activation, optional
         Activation applied to the hidden layer. Default is :class:`GELU`.
+    gated : bool, optional
+        Widen the first projection to :math:`2 d_{hidden}` and gate one half of it by the activation
+        applied to the other. The widened projection stays one weight. Default is False.
     bias : bool, optional
         Include bias terms in both linear layers. Default is True.
+    fc_out_initializer : Initializer, optional
+        How the second layer's weight is drawn. The hidden layer is unaffected. Xavier normal when omitted,
+        as for any other weight.
+
+    Examples
+    --------
+    The position-wise MLP of a transformer block: widen by ``mlp_ratio``, apply a nonlinearity, project
+    back. Pass ``hidden_dim`` to set the width directly instead of as a multiple:
+
+    .. code-block:: python
+
+        from pytensor_ml.activations import GELU
+        from pytensor_ml.layers import FeedForward, Input
+
+        X = Input("X", shape=(None, 128, 256))
+        activations = FeedForward("ff", d_model=256, mlp_ratio=4, activation=GELU())(X)
     """
 
     def __init__(
         self,
-        name: str | None,
+        name: str | None = None,
+        *,
         d_model: int,
         hidden_dim: int | None = None,
         mlp_ratio: int = 4,
         activation: Activation | None = None,
+        gated: bool = False,
         bias: bool = True,
+        fc_out_initializer: Initializer | None = None,
     ):
-        self.name = name if name else "FeedForward"
+        self.name = _resolve_layer_name(name, type(self).__name__, "d_model")
         self.d_model = d_model
         self.hidden_dim = hidden_dim if hidden_dim is not None else mlp_ratio * d_model
         self.activation = activation if activation is not None else GELU()
+        self.gated = gated
 
-        self.fc_in = Linear(f"{self.name}_fc_in", d_model, self.hidden_dim, bias)
-        self.fc_out = Linear(f"{self.name}_fc_out", self.hidden_dim, d_model, bias)
+        self.fc_in = Linear(
+            f"{self.name}_fc_in",
+            n_in=d_model,
+            n_out=2 * self.hidden_dim if gated else self.hidden_dim,
+            bias=bias,
+        )
+        self.fc_out = Linear(
+            f"{self.name}_fc_out",
+            n_in=self.hidden_dim,
+            n_out=d_model,
+            bias=bias,
+            weight_initializer=fc_out_initializer,
+        )
 
     def __call__(self, x: pt.TensorLike) -> pt.TensorVariable:
         x = pt.as_tensor(x)
-        hidden = self.activation(self.fc_in(x))
+        projected = self.fc_in(x)
+        if self.gated:
+            value, gate = pt.split(projected, [self.hidden_dim] * 2, axis=-1)
+            hidden = value * self.activation(gate)
+        else:
+            hidden = self.activation(projected)
+
         out = self.fc_out(hidden)
         out.name = f"{self.name}_output"
         return out
@@ -110,14 +162,38 @@ class TransformerBlock(Layer):
         Number of key/value heads for grouped-query attention. Defaults to ``n_head``.
     epsilon : float, optional
         Constant added to the layer-norm variance for numerical stability. Default is 1e-5.
+    residual_initializer : Initializer, optional
+        How the two projections that write back into the residual stream are drawn -- attention's output
+        projection and the feed-forward's second layer. Their siblings keep the default, which is what
+        GPT-style initialization asks for: a residual stream accumulates one contribution per block, so those
+        projections are scaled by :math:`1/\sqrt{2 n_\text{layer}}` while the rest are not. The depth is not
+        known here, so the scaling belongs in the initializer the caller passes.
+
+    Examples
+    --------
+    Attention and feed-forward with their residual connections and norms, which is the unit a transformer
+    repeats. ``norm_first`` puts the norm inside the residual branch, the pre-norm arrangement that trains
+    stably without a warmup:
+
+    .. code-block:: python
+
+        from pytensor_ml.layers import Input, Sequential, TransformerBlock
+
+        X = Input("X", shape=(None, 128, 256))
+        network = Sequential(
+            TransformerBlock("block1", d_model=256, n_head=8, norm_first=True),
+            TransformerBlock("block2", d_model=256, n_head=8, norm_first=True),
+        )
+
+        activations = network(X)
     """
 
     def __init__(
         self,
-        name: str | None,
+        name: str | None = None,
+        *,
         d_model: int,
         n_head: int,
-        *,
         mlp_ratio: int = 4,
         activation: Activation | None = None,
         norm_first: bool = True,
@@ -125,9 +201,11 @@ class TransformerBlock(Layer):
         bias: bool = True,
         is_causal: bool = False,
         n_kv_head: int | None = None,
+        fused_qkv: bool = False,
         epsilon: float = 1e-5,
+        residual_initializer: Initializer | None = None,
     ):
-        self.name = name if name else "TransformerBlock"
+        self.name = _resolve_layer_name(name, type(self).__name__, "d_model")
         self.d_model = d_model
         self.norm_first = norm_first
 
@@ -135,14 +213,21 @@ class TransformerBlock(Layer):
         self.norm2 = LayerNorm(f"{self.name}_norm2", n_in=d_model, epsilon=epsilon)
         self.attn = MultiheadAttention(
             f"{self.name}_attn",
-            d_model,
-            n_head,
+            n_embd=d_model,
+            n_head=n_head,
             n_kv_head=n_kv_head,
+            fused_qkv=fused_qkv,
             bias=bias,
             is_causal=is_causal,
+            out_proj_initializer=residual_initializer,
         )
         self.ff = FeedForward(
-            f"{self.name}_ff", d_model, mlp_ratio=mlp_ratio, activation=activation, bias=bias
+            f"{self.name}_ff",
+            d_model=d_model,
+            mlp_ratio=mlp_ratio,
+            activation=activation,
+            bias=bias,
+            fc_out_initializer=residual_initializer,
         )
         self.attn_dropout = (
             Dropout(f"{self.name}_attn_dropout", p=dropout) if dropout > 0 else _identity

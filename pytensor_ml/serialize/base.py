@@ -157,9 +157,10 @@ def const_from_json(const_dict: dict):
     return pt.constant(value, dtype=graph_type.dtype)
 
 
-def qualname(op: Op) -> str:
-    """Return the import path of an op's class. Note this makes a class's module part of the on-disk
-    format: moving an op to another module changes what :func:`resolve_class` must find."""
+def qualname(op: object) -> str:
+    """Return the import path of an object's class. Note this makes a class's module part of the on-disk
+    format: moving it to another module changes what :func:`resolve_class` must find. Takes an instance
+    rather than a class, and anything carrying ``__props__`` rather than ops alone."""
     return f"{type(op).__module__}.{type(op).__name__}"
 
 
@@ -168,8 +169,8 @@ def resolve_class(path: str):
     return getattr(importlib.import_module(module), name)
 
 
-def props_to_json(op: Op) -> dict:
-    """Encode an op's ``__props__`` values, or an empty dict for an op that declares none."""
+def props_to_json(op: object) -> dict:
+    """Encode an object's ``__props__`` values, or an empty dict for one that declares none."""
     return {name: prop_to_json(getattr(op, name)) for name in getattr(op, "__props__", ())}
 
 

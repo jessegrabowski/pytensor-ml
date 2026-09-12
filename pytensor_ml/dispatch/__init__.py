@@ -9,6 +9,8 @@ import sys
 _REGISTRATIONS = {
     "pytensor.link.jax.dispatch": "pytensor_ml.dispatch.jax",
     "pytensor.link.mlx.dispatch": "pytensor_ml.dispatch.mlx",
+    "pytensor.link.numba.dispatch": "pytensor_ml.dispatch.numba",
+    "pytensor.link.pytorch.dispatch": "pytensor_ml.dispatch.pytorch",
 }
 
 
